@@ -80,40 +80,63 @@ npm run test-rag   # 需先 compile；运行 electron-main/rag 单元测试
     1. 安装 [Visual Studio 2022 Community](https://visualstudio.microsoft.com/zh-hans/vs/)。
     2. 在“工作负载”中勾选：**“使用 C++ 的桌面开发”** 与 **“Node.js 开发工具”**。
     3. 在“单个组件”中勾选：`MSVC v143 - VS 2022 C++ x64/x86 Spectre-mitigated libs`、`C++ ATL` 以及 `C++ MFC`（均选择最新版本并带 Spectre 缓解）。
+    4. **中文 Windows**：请使用下文推荐的 `.\scripts\npm-install.bat` 安装依赖（脚本内已设置 `CL=/utf-8`，避免 `usearch` 等模块报 `C4819` / `C2065`）。也可在系统环境变量中永久设置 `CL=/utf-8`。
   * **macOS**：安装 Xcode 和命令行工具（通常系统自带 Python 和 gcc 即可）。
   * **Linux**：安装 `build-essential`、`g++`、`libx11-dev`、`libxkbfile-dev`、`libsecret-1-dev`。
 
 ### 2. 开发编译步骤 (Compilation Steps)
 
-在项目根目录下依次运行以下命令进行依赖安装和编译：
+在项目根目录下依次运行以下命令。
+
+#### Windows（推荐）
+
+```bat
+.\scripts\npm-install.bat
+.\scripts\rebuild-native.bat
+npm run buildreact
+node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile
+.\scripts\code.bat
+```
+
+说明：
+
+* `npm-install.bat`：安装依赖，并设置 `CL=/utf-8` 以兼容中文 Windows 代码页。
+* `rebuild-native.bat`：针对 Electron 34.3.2 编译 `spdlog`、`node-pty`、`ripgrep` 等原生模块；若启动时报 `Could not locate the bindings file` 或 `rg.exe ENOENT`，请重新执行此步骤。
+* 最后一步直接启动 MCode 开发者模式窗口。
+
+#### macOS / Linux
 
 ```bash
-# 1. 安装项目所有依赖项（可能需要数分钟以编译 C++ 原生模块）
+# 1. 安装依赖（可能需要数分钟）
 npm install
 
 # 2. 构建 React 前端面板与设置中心
 npm run buildreact
 
-# 3. 编译 TypeScript 核心服务与底座逻辑
-# 方式 A：一次性全量编译（由于项目极其庞大，推荐使用以下指令分配 8GB 内存进行编译，以防止 Node 内存溢出）
+# 3. 全量编译（推荐分配 8GB 内存，防止 Node 溢出）
 node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile
 
-# 方式 B：开启监听模式进行热编译开发（推荐，按 Ctrl+Shift+B 亦可启动）
+# 4. 启动
+./scripts/code.sh
+```
+
+#### 开发时热编译（可选）
+
+全量编译完成后，日常开发可改用监听模式（亦可按 `Ctrl+Shift+B` 启动）：
+
+```bash
 npm run watch
 ```
 
+然后另开终端运行 `.\scripts\code.bat`（Windows）或 `./scripts/code.sh`（macOS / Linux）。
+
 ### 3. 运行 MCode (Running the Editor)
 
-编译完成后，可通过以下脚本直接启动 MCode 开发者模式窗口：
+若已按上文完成编译，Windows 可直接执行 `.\scripts\code.bat`；macOS / Linux 执行：
 
-* **Windows**:
-  ```bash
-  .\scripts\code.bat
-  ```
-* **macOS / Linux**:
-  ```bash
-  ./scripts/code.sh
-  ```
+```bash
+./scripts/code.sh
+```
 
 ---
 

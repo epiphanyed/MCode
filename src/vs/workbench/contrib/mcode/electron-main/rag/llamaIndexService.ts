@@ -33,8 +33,16 @@ import type {
 } from '../../common/mcodeRagTypes.js';
 import { defaultRagQueryOptions, DEFAULT_RAG_EMBEDDING, OLLAMA_EMBEDDING_DEFAULT_DIMENSIONS, OPENAI_EMBEDDING_DEFAULT_DIMENSIONS } from '../../common/mcodeRagTypes.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
-import { chunkCodeForIndexing, CHUNK_ENGINE, getChunkDocId } from './semanticCodeChunker.js';
+import { chunkCodeForIndexing, CHUNK_ENGINE, getChunkDocId, MAX_SYMBOL_LINES } from './semanticCodeChunker.js';
 import { pathContainsSkippedDirectory, shouldSkipDirectoryName } from './ragWalkFilters.js';
+import { resetTreeSitterLazyProbeCache } from './treeSitterLazy.js';
+import { disposeAllTreeSitterParsers, resetTreeSitterRuntimeForIndexBuild } from './treeSitterRuntime.js';
+import {
+	isTreeSitterDeferred,
+	resetTreeSitterDeferState,
+	takeTreeSitterDeferredFiles,
+	type TreeSitterIndexPass,
+} from './treeSitterDeferRetry.js';
 import { rerankRetrievedNodes, applyMMRDiversity, type RetrievedNode } from './ragReranker.js';
 import {
     assignDocParentChunks,
@@ -206,6 +214,7 @@ export class LlamaIndexService {
     private milvusDualWrite = false;
     /** Set per queryContext call when ragCompactMode is enabled (CTX-C3). */
     private queryCompactMode = false;
+    private indexBuildTreeSitterPass: TreeSitterIndexPass = 'off';
     private indexFileFailureCount = 0;
     private indexFileFailureSamples: string[] = [];
     private static readonly INDEX_FAIL_LOG_LIMIT = 5;
@@ -576,16 +585,8 @@ export class LlamaIndexService {
         return localStoreHasVectorDb(layout);
     }
 
-    private clearLocalStore(localStorePath: string): void {
-        if (fs.existsSync(localStorePath)) {
-            fs.rmSync(localStorePath, { recursive: true, force: true });
-        }
-        fs.mkdirSync(localStorePath, { recursive: true });
-        this.resetLocalStoreState();
-    }
-
     private resetLocalStoreState(): void {
-        void this.closeLocalVectorStore();
+        this.localVectorStore = null;
         this.localVectorDimensions = 0;
         this.fileChunkMap = {};
         this.docParentMap = {};
@@ -594,18 +595,37 @@ export class LlamaIndexService {
         this.symbolNameIndex = new Map();
     }
 
+    private async removeLocalStoreDirectory(localStorePath: string, retries = 6): Promise<void> {
+        for (let attempt = 0; attempt < retries; attempt++) {
+            try {
+                await fs.promises.rm(localStorePath, { recursive: true, force: true });
+                return;
+            } catch (err) {
+                const code = (err as NodeJS.ErrnoException).code;
+                if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'ENOTEMPTY') {
+                    throw err;
+                }
+                if (attempt === retries - 1) {
+                    throw new Error(
+                        `[RAG] Cannot clear index directory (files still in use). Close other MCode windows and retry rebuild. Original: ${String(err)}`,
+                    );
+                }
+                await this.closeLocalVectorStore();
+                await this.yieldToEventLoop();
+                await new Promise<void>(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+            }
+        }
+    }
+
     private async clearLocalStoreAsync(localStorePath: string): Promise<void> {
+        await this.closeLocalVectorStore();
+        await this.yieldToEventLoop();
         if (fs.existsSync(localStorePath)) {
-            await fs.promises.rm(localStorePath, { recursive: true, force: true });
+            await this.removeLocalStoreDirectory(localStorePath);
             await this.yieldToEventLoop();
         }
         await fs.promises.mkdir(localStorePath, { recursive: true });
         this.resetLocalStoreState();
-    }
-
-    private clearLocalStoreForFreshBuild(localStorePath: string): void {
-        this.clearLocalStore(localStorePath);
-        this.deleteBuildCheckpoint(localStorePath);
     }
 
     private async clearLocalStoreForFreshBuildAsync(localStorePath: string): Promise<void> {
@@ -1375,7 +1395,7 @@ export class LlamaIndexService {
         return node;
     }
     private async semanticChunksToNodes(normalizedPath: string, fileName: string, content: string): Promise<BaseNode[]> {
-        const semanticChunks = await chunkCodeForIndexing(content, normalizedPath);
+        const semanticChunks = await chunkCodeForIndexing(content, normalizedPath, MAX_SYMBOL_LINES, this.indexBuildTreeSitterPass);
         this.codeSymbolMap[normalizedPath] = semanticChunks.map(chunk => ({
             startLine: chunk.startLine,
             endLine: chunk.endLine,
@@ -1479,7 +1499,74 @@ export class LlamaIndexService {
         }
     }
 
+    private beginTreeSitterIndexBuild(): void {
+        resetTreeSitterRuntimeForIndexBuild();
+        resetTreeSitterLazyProbeCache();
+        resetTreeSitterDeferState();
+        this.indexBuildTreeSitterPass = 'primary';
+    }
+
+    private finishTreeSitterIndexBuild(): void {
+        this.indexBuildTreeSitterPass = 'off';
+        disposeAllTreeSitterParsers();
+    }
+
+    private async retryDeferredTreeSitterFiles(
+        mdParser: MarkdownNodeParser,
+        onFileIndexed: (filePath: string, content: string, nodes: BaseNode[]) => Promise<void> | void,
+    ): Promise<{ retried: number; regexFallback: number; addedChunks: number }> {
+        const deferred = takeTreeSitterDeferredFiles();
+        if (deferred.length === 0) {
+            return { retried: 0, regexFallback: 0, addedChunks: 0 };
+        }
+
+        console.log(`[RAG] Retrying tree-sitter for ${deferred.length} file(s) deferred due to WASM errors...`);
+        disposeAllTreeSitterParsers();
+        await this.yieldToEventLoop();
+
+        const savedPass = this.indexBuildTreeSitterPass;
+        this.indexBuildTreeSitterPass = 'retry';
+        let addedChunks = 0;
+        let regexFallback = 0;
+
+        for (const filePath of deferred) {
+            try {
+                const content = await this.readFileIfIndexable(filePath);
+                if (content === null) {
+                    continue;
+                }
+                const nodes = await this.chunkFile(filePath, content, mdParser);
+                addedChunks += nodes.length;
+                if (nodes.length === 0) {
+                    regexFallback += 1;
+                }
+                await onFileIndexed(filePath, content, nodes);
+                await this.updateCodeGraphSafely(this.normalizeFilePath(filePath), content);
+            } catch (err) {
+                regexFallback += 1;
+                console.warn(`[RAG] tree-sitter retry failed for ${filePath}, skipped:`, err);
+            }
+        }
+
+        this.indexBuildTreeSitterPass = savedPass;
+        if (regexFallback > 0) {
+            console.warn(`[RAG] ${regexFallback}/${deferred.length} deferred file(s) used regex or were skipped after tree-sitter retry failure.`);
+        } else {
+            console.log(`[RAG] All ${deferred.length} deferred file(s) indexed with tree-sitter on retry.`);
+        }
+        return { retried: deferred.length, regexFallback, addedChunks };
+    }
+
     private async scanWorkspaceNodes(): Promise<ScanIndexResult> {
+        this.beginTreeSitterIndexBuild();
+        try {
+            return await this.scanWorkspaceNodesCore();
+        } finally {
+            this.finishTreeSitterIndexBuild();
+        }
+    }
+
+    private async scanWorkspaceNodesCore(): Promise<ScanIndexResult> {
         const mdParser = this.createMdParser();
         const targetFiles = this.collectTargetFiles();
         const allNodes: BaseNode[] = [];
@@ -1521,6 +1608,21 @@ export class LlamaIndexService {
                     currentFile: path.basename(filePath),
                 });
             }
+        }
+
+        const retryScan = await this.retryDeferredTreeSitterFiles(mdParser, async (filePath, _content, nodes) => {
+            const normalized = this.normalizeFilePath(filePath);
+            fileChunkMap[normalized] = nodes.length;
+            allNodes.push(...nodes);
+        });
+        if (retryScan.retried > 0) {
+            this.fireProgress({
+                phase: 'scanning',
+                filesDone: targetFiles.length,
+                filesTotal: targetFiles.length,
+                chunks: allNodes.length,
+                currentFile: 'tree-sitter retry pass',
+            });
         }
 
         let gitCommitCount = 0;
@@ -1735,6 +1837,21 @@ export class LlamaIndexService {
         dimensions: number,
         buildOptions?: LocalIndexBuildOptions,
     ): Promise<{ fileCount: number; chunkCount: number }> {
+        this.beginTreeSitterIndexBuild();
+        try {
+            return await this.buildLocalIndexCore(localStorePath, provider, model, dimensions, buildOptions);
+        } finally {
+            this.finishTreeSitterIndexBuild();
+        }
+    }
+
+    private async buildLocalIndexCore(
+        localStorePath: string,
+        provider: string,
+        model: string,
+        dimensions: number,
+        buildOptions?: LocalIndexBuildOptions,
+    ): Promise<{ fileCount: number; chunkCount: number }> {
         const forceFresh = buildOptions?.forceFresh === true;
         let resume = buildOptions?.resume === true && !forceFresh;
 
@@ -1832,6 +1949,7 @@ export class LlamaIndexService {
             }
 
             const filePath = pendingFiles[i];
+            const normalizedPath = this.normalizeFilePath(filePath);
 
             try {
                 totalChunks += await this.indexSingleFileForLocalBuild(filePath, mdParser, dimensions);
@@ -1839,7 +1957,9 @@ export class LlamaIndexService {
                 this.recordIndexFileFailure(filePath, 'chunk', e);
             }
 
-            indexedFiles.add(this.normalizeFilePath(filePath));
+            if (!isTreeSitterDeferred(normalizedPath)) {
+                indexedFiles.add(normalizedPath);
+            }
             filesDone += 1;
             filesSinceMetadataFlush += 1;
             filesSinceVectorFlush += 1;
@@ -1884,6 +2004,27 @@ export class LlamaIndexService {
                 await this.flushBuildFullToDisk(localStorePath);
                 filesSinceVectorFlush = 0;
             }
+        }
+
+        const retryBuild = await this.retryDeferredTreeSitterFiles(mdParser, async (filePath, _content, nodes) => {
+            if (nodes.length === 0) {
+                return;
+            }
+            const normalized = this.normalizeFilePath(filePath);
+            await this.insertNodesForLocalBuild(nodes, dimensions);
+            this.fileChunkMap[normalized] = nodes.length;
+            indexedFiles.add(normalized);
+        });
+        totalChunks += retryBuild.addedChunks;
+        if (retryBuild.retried > 0) {
+            this.fireProgress({
+                phase: 'scanning',
+                filesDone: targetFiles.length,
+                filesTotal: targetFiles.length,
+                chunks: totalChunks,
+                currentFile: 'tree-sitter retry pass',
+            });
+            await this.flushBuildFullToDisk(localStorePath);
         }
 
         let gitDocIds: string[] = [];
@@ -1973,7 +2114,7 @@ export class LlamaIndexService {
         this.compileCommandPathsCache = undefined;
 
         if (dualWrite) {
-            this.clearLocalStoreForFreshBuild(localStorePath);
+            await this.clearLocalStoreForFreshBuildAsync(localStorePath);
         } else {
             fs.mkdirSync(localStorePath, { recursive: true });
             this.localVectorStore = null;

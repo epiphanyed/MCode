@@ -8,6 +8,8 @@ import { offsetChunkLineNumbers, stripLeadingFileHeader } from './fileHeaderStri
 import { applyLeadingCommentsToChunks } from './symbolLeadingComments.js';
 import { chunkJava } from './javaSemanticChunker.js';
 import { loadTreeSitterChunkerModule, isTreeSitterRuntimeReady } from './treeSitterLazy.js';
+import { isTreeSitterWasmAbortError } from './treeSitterRuntime.js';
+import { recordTreeSitterDefer, type TreeSitterIndexPass, isTreeSitterDeferred } from './treeSitterDeferRetry.js';
 import { canTreeSitterParse } from './treeSitterGrammarMap.js';
 
 export interface SemanticCodeChunk {
@@ -595,7 +597,12 @@ export const CHUNK_ENGINE = 'tree-sitter-hybrid-v1';
  * Hybrid chunking for indexing: tree-sitter AST when supported, else regex chunker.
  * Strips leading copyright/license headers before slicing (line numbers preserved via offset).
  */
-export async function chunkCodeForIndexing(content: string, filePath: string, maxSymbolLines = MAX_SYMBOL_LINES): Promise<SemanticCodeChunk[]> {
+export async function chunkCodeForIndexing(
+	content: string,
+	filePath: string,
+	maxSymbolLines = MAX_SYMBOL_LINES,
+	treeSitterPass: TreeSitterIndexPass = 'off',
+): Promise<SemanticCodeChunk[]> {
 	try {
 		const { body, headerLineCount } = stripLeadingFileHeader(content);
 		const sliceContent = headerLineCount > 0 ? body : content;
@@ -613,11 +620,22 @@ export async function chunkCodeForIndexing(content: string, filePath: string, ma
 					chunks = applyLargeChunkSplit(sliceContent, astChunks, maxSymbolLines);
 				}
 			} catch (err) {
-				console.warn(`[RAG] tree-sitter chunk failed for ${filePath}, using regex fallback:`, err);
+				if (treeSitterPass === 'primary' && isTreeSitterWasmAbortError(err)) {
+					recordTreeSitterDefer(filePath, err);
+					return [];
+				}
+				if (treeSitterPass === 'retry') {
+					console.warn(`[RAG] tree-sitter retry failed for ${filePath}, using regex fallback:`, err);
+				} else {
+					console.warn(`[RAG] tree-sitter chunk failed for ${filePath}, using regex fallback:`, err);
+				}
 			}
 		}
 
 		if (!chunks) {
+			if (isTreeSitterDeferred(filePath)) {
+				return [];
+			}
 			chunks = chunkCodeSemantically(sliceContent, filePath, maxSymbolLines);
 		}
 
@@ -626,6 +644,10 @@ export async function chunkCodeForIndexing(content: string, filePath: string, ma
 		}
 		return chunks;
 	} catch (err) {
+		if (treeSitterPass === 'primary' && isTreeSitterWasmAbortError(err)) {
+			recordTreeSitterDefer(filePath, err);
+			return [];
+		}
 		console.warn(`[RAG] chunkCodeForIndexing failed for ${filePath}, using whole-file fallback:`, err);
 		return chunkCodeSemantically(content, filePath, maxSymbolLines);
 	}

@@ -194,6 +194,11 @@ export class LocalSqliteVectorStore {
 
 	async close(): Promise<void> {
 		await this.persistHnsw();
+		try {
+			await run(this.db, 'PRAGMA wal_checkpoint(TRUNCATE)');
+		} catch {
+			// best-effort before closing handles (helps release .db-wal/.db-shm on Windows)
+		}
 		await new Promise<void>((resolve, reject) => {
 			this.db.close(err => (err ? reject(err) : resolve()));
 		});

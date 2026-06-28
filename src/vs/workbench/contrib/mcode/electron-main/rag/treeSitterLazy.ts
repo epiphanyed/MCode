@@ -53,3 +53,8 @@ export async function isTreeSitterRuntimeReady(): Promise<boolean> {
 		return false;
 	}
 }
+
+/** Clear cached readiness after index build so the next build re-probes. */
+export function resetTreeSitterLazyProbeCache(): void {
+	runtimeReady = undefined;
+}

@@ -5,7 +5,10 @@
 
 import type * as Parser from '@vscode/tree-sitter-wasm';
 import type { SemanticCodeChunk } from './semanticCodeChunker.js';
-import { createTreeSitterParser } from './treeSitterRuntime.js';
+import {
+	deleteTreeSitterTree,
+	parseWithSharedTreeSitterParser,
+} from './treeSitterRuntime.js';
 import { getTreeSitterGrammarForFile } from './treeSitterGrammarMap.js';
 
 export { canTreeSitterParse } from './treeSitterGrammarMap.js';
@@ -155,20 +158,23 @@ export async function chunkWithTreeSitter(content: string, filePath: string): Pr
 		return null;
 	}
 
-	const parser = await createTreeSitterParser(grammar);
-	const tree = parser.parse(content);
+	const tree = await parseWithSharedTreeSitterParser(grammar, content);
 	if (!tree) {
 		return null;
 	}
 
-	const raw: Array<{ start: number; end: number; text: string; symbolType: string; symbolName?: string; startLine: number; endLine: number }> = [];
-	collectSemanticNodes(tree.rootNode, content, raw);
+	try {
+		const raw: Array<{ start: number; end: number; text: string; symbolType: string; symbolName?: string; startLine: number; endLine: number }> = [];
+		collectSemanticNodes(tree.rootNode, content, raw);
 
-	if (raw.length === 0) {
-		return null;
+		if (raw.length === 0) {
+			return null;
+		}
+
+		const deduped = dedupeNestedSpans(raw);
+		deduped.sort((a, b) => a.startLine - b.startLine);
+		return deduped;
+	} finally {
+		deleteTreeSitterTree(tree);
 	}
-
-	const deduped = dedupeNestedSpans(raw);
-	deduped.sort((a, b) => a.startLine - b.startLine);
-	return deduped;
 }

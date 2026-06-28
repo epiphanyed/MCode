@@ -121,6 +121,64 @@ export async function createTreeSitterParser(grammarWasmName: string): Promise<P
 	return parser;
 }
 
+const parserPool = new Map<string, Parser.Parser>();
+
+/** Skip AST parse for very large sources to limit WASM peak memory (regex fallback still runs). */
+export const MAX_TREE_SITTER_PARSE_BYTES = 1024 * 1024;
+
+export function isTreeSitterWasmAbortError(err: unknown): boolean {
+	const message = err instanceof Error ? err.message : String(err);
+	return /Aborted|RuntimeError|out of memory|allocation failed/i.test(message);
+}
+
+/** Release pooled parsers at index build boundaries. */
+export function resetTreeSitterRuntimeForIndexBuild(): void {
+	disposeAllTreeSitterParsers();
+}
+
+export async function getSharedTreeSitterParser(grammarWasmName: string): Promise<Parser.Parser> {
+	let parser = parserPool.get(grammarWasmName);
+	if (!parser) {
+		parser = await createTreeSitterParser(grammarWasmName);
+		parserPool.set(grammarWasmName, parser);
+	}
+	return parser;
+}
+
+export function deleteTreeSitterTree(tree: Parser.Tree | null | undefined): void {
+	if (!tree) {
+		return;
+	}
+	try {
+		tree.delete();
+	} catch {
+		// best-effort WASM cleanup
+	}
+}
+
+export function disposeAllTreeSitterParsers(): void {
+	for (const parser of parserPool.values()) {
+		try {
+			parser.delete();
+		} catch {
+			// best-effort
+		}
+	}
+	parserPool.clear();
+}
+
+/** Parse with a pooled parser; caller must delete the returned tree. */
+export async function parseWithSharedTreeSitterParser(
+	grammarWasmName: string,
+	content: string,
+): Promise<Parser.Tree | null> {
+	if (Buffer.byteLength(content, 'utf8') > MAX_TREE_SITTER_PARSE_BYTES) {
+		return null;
+	}
+	const parser = await getSharedTreeSitterParser(grammarWasmName);
+	return parser.parse(content);
+}
+
 let loadProbe: boolean | undefined;
 
 /** True when wasm files exist on disk (cheap sync check). */

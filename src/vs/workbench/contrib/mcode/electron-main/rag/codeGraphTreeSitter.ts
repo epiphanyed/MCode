@@ -7,6 +7,10 @@ import * as path from 'path';
 import type * as Parser from '@vscode/tree-sitter-wasm';
 import type { CodeSymbolEntry } from './ragQueryHelpers.js';
 import { canTreeSitterParse, getTreeSitterGrammarForFile } from './treeSitterGrammarMap.js';
+import {
+	deleteTreeSitterTree,
+	parseWithSharedTreeSitterParser,
+} from './treeSitterRuntime.js';
 import { resolveImportTarget, isCallKeyword } from './codeGraphBuilder.js';
 
 export interface TreeSitterGraphExtraction {
@@ -160,21 +164,17 @@ export async function extractGraphEdgesWithTreeSitter(
 		return null;
 	}
 
-	let createTreeSitterParser: (grammar: string) => Promise<import('@vscode/tree-sitter-wasm').Parser>;
-	try {
-		({ createTreeSitterParser } = await import('./treeSitterRuntime.js'));
-	} catch {
-		return null;
-	}
-
-	const parser = await createTreeSitterParser(grammar);
-	const tree = parser.parse(content);
+	const tree = await parseWithSharedTreeSitterParser(grammar, content);
 	if (!tree) {
 		return null;
 	}
 
-	return {
-		imports: collectImports(tree.rootNode, filePath, workspaceRoot),
-		callsBySymbolLine: collectCallsBySymbol(tree.rootNode, symbols),
-	};
+	try {
+		return {
+			imports: collectImports(tree.rootNode, filePath, workspaceRoot),
+			callsBySymbolLine: collectCallsBySymbol(tree.rootNode, symbols),
+		};
+	} finally {
+		deleteTreeSitterTree(tree);
+	}
 }

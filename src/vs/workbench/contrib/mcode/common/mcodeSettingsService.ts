@@ -292,6 +292,7 @@ class VoidSettingsService extends Disposable implements IVoidSettingsService {
 			
 			// add autoAcceptLLMChanges feature
 			if (readS.globalSettings.autoAcceptLLMChanges === undefined) readS.globalSettings.autoAcceptLLMChanges = false;
+			if (readS.globalSettings.agentDeferredEditReview === undefined) readS.globalSettings.agentDeferredEditReview = true;
 
 			// add vector index settings
 			if (readS.globalSettings.indexType === undefined) readS.globalSettings.indexType = 'local';

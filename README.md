@@ -100,6 +100,8 @@ node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile
 
 说明：
 
+* `npm run buildreact` 会同步 React 产物到 `out/vs/.../react/out`（`code.bat` 实际加载路径）；改 UI 后只需 buildreact + 重启，不必全量 compile。
+
 * `npm-install.bat`：安装依赖，并设置 `CL=/utf-8` 以兼容中文 Windows 代码页。
 * `rebuild-native.bat`：针对 Electron 34.3.2 编译 `spdlog`、`node-pty`、`ripgrep` 等原生模块；若启动时报 `Could not locate the bindings file` 或 `rg.exe ENOENT`，请重新执行此步骤。
 * 最后一步直接启动 MCode 开发者模式窗口。
@@ -112,6 +114,7 @@ npm install
 
 # 2. 构建 React 前端面板与设置中心
 npm run buildreact
+# buildreact 会自动把 react/out 同步到 out/vs/.../react/out（code.bat 实际加载路径）
 
 # 3. 全量编译（推荐分配 8GB 内存，防止 Node 溢出）
 node --max-old-space-size=8192 ./node_modules/gulp/bin/gulp.js compile

@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
-import { stripLeadingFileHeader, offsetChunkLineNumbers } from './fileHeaderStripper.js';
+import { stripLeadingFileHeader, offsetChunkLineNumbers } from '../../common/helpers/fileHeaderStripper.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 
 suite('fileHeaderStripper', () => {

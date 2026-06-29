@@ -469,6 +469,9 @@ export const EditToolAcceptRejectButtonsHTML = ({
 	const chatThreadsStreamState = useChatThreadsStreamState(threadId)
 	const isRunning = chatThreadsStreamState?.isRunning
 
+	const deferBatchReview = settingsState.globalSettings.agentDeferredEditReview
+		&& settingsState.globalSettings.chatMode === 'agent'
+
 	const isDisabled = !!isFeatureNameDisabled('Chat', settingsState) || !applyBoxId
 
 	const onAccept = useCallback(() => {
@@ -486,6 +489,9 @@ export const EditToolAcceptRejectButtonsHTML = ({
 	}
 
 	if (streamState === 'idle-has-changes') {
+		if (deferBatchReview && (isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'awaiting_batch_review')) {
+			return null
+		}
 		if (isRunning === 'LLM' || isRunning === 'tool') return null
 
 		return <>

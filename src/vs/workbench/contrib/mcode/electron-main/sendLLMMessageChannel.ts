@@ -12,6 +12,7 @@ import { EventLLMMessageOnTextParams, EventLLMMessageOnErrorParams, EventLLMMess
 import { sendLLMMessage } from './llmMessage/sendLLMMessage.js'
 import { IMetricsService } from '../common/metricsService.js';
 import { sendLLMMessageToProviderImplementation } from './llmMessage/sendLLMMessage.impl.js';
+import { fetchLlamaServerContextWindow } from './llmMessage/llamaServerProps.impl.js';
 
 // NODE IMPLEMENTATION - calls actual sendLLMMessage() and returns listeners to it
 
@@ -79,6 +80,9 @@ export class LLMMessageChannel implements IServerChannel {
 			}
 			else if (command === 'openAICompatibleList') {
 				this._callOpenAICompatibleList(params)
+			}
+			else if (command === 'fetchLlamaServerContextWindow') {
+				return await fetchLlamaServerContextWindow(params.endpoint as string)
 			}
 			else {
 				throw new Error(`Void sendLLM: command "${command}" not recognized.`)

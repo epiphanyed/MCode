@@ -2183,6 +2183,18 @@ export const Settings = () => {
 														<span className='text-void-fg-3 text-xs pointer-events-none'>Auto-accept LLM changes</span>
 													</div>
 												</ErrorBoundary>
+
+												{/* Agent deferred edit review */}
+												<ErrorBoundary>
+													<div className='flex items-center gap-x-2 my-2'>
+														<VoidSwitch
+															size='xs'
+															value={settingsState.globalSettings.agentDeferredEditReview}
+															onChange={(newVal) => mcodeSettingsService.setGlobalSetting('agentDeferredEditReview', newVal)}
+														/>
+														<span className='text-void-fg-3 text-xs pointer-events-none'>Agent: batch-review file edits at end</span>
+													</div>
+												</ErrorBoundary>
 											</div>
 										</div>
 

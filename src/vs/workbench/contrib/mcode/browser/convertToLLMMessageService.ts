@@ -19,6 +19,12 @@ import { EndOfLinePreference } from '../../../../editor/common/model.js';
 import { ToolName } from '../common/toolsServiceTypes.js';
 import { IMCPService } from '../common/mcpService.js';
 import { estimateTokenCount, MIN_RETAINED_CHARS } from '../common/helpers/tokenEstimate.js';
+import { stripDiagramBlocksForLlm } from '../common/helpers/diagramBlockStripper.js';
+import { stripFileHeaderForToolOutput } from '../common/helpers/fileHeaderStripper.js';
+import { agentReadRegistryKey } from '../common/helpers/agentReadRegistry.js';
+import { BuiltinToolCallParams } from '../common/toolsServiceTypes.js';
+import { IRepositoryMapService } from '../common/repositoryMapService.js';
+
 
 export const EMPTY_MESSAGE = '(empty message)'
 
@@ -354,7 +360,7 @@ const prepareOpenAIOrAnthropicMessages = ({
 
 	while (remainingTokensToTrim > 0) {
 		i += 1
-		if (i > 100) break
+		if (i > messages.length * 2) break
 
 		const trimIdx = _findLargestByWeight(messages)
 		const m = messages[trimIdx]
@@ -555,6 +561,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		@IVoidSettingsService private readonly mcodeSettingsService: IVoidSettingsService,
 		@IVoidModelService private readonly mcodeModelService: IVoidModelService,
 		@IMCPService private readonly mcpService: IMCPService,
+		@IRepositoryMapService private readonly repositoryMapService: IRepositoryMapService,
 	) {
 		super()
 	}
@@ -616,7 +623,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 	// --- LLM Chat messages ---
 
-	private _chatMessagesToSimpleMessages(chatMessages: ChatMessage[]): SimpleLLMMessage[] {
+	private _chatMessagesToSimpleMessages(chatMessages: ChatMessage[], activeReadKeysSet?: Set<string>): SimpleLLMMessage[] {
 		const simpleLLMMessages: SimpleLLMMessage[] = []
 
 		for (const m of chatMessages) {
@@ -625,14 +632,40 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			if (m.role === 'assistant') {
 				simpleLLMMessages.push({
 					role: m.role,
-					content: m.displayContent,
+					content: stripDiagramBlocksForLlm(m.displayContent),
 					anthropicReasoning: m.anthropicReasoning,
 				})
 			}
 			else if (m.role === 'tool') {
+				let content = stripDiagramBlocksForLlm(m.content);
+				if (activeReadKeysSet && m.type === 'success') {
+					if (m.name === 'read_file') {
+						const p = (m as any).params as BuiltinToolCallParams['read_file'];
+						const key = agentReadRegistryKey('read_file', p);
+						const hasKey = activeReadKeysSet ? activeReadKeysSet.has(key) : false;
+						console.log('[RAG][debug] checking read_file key:', key, 'hasKey:', hasKey);
+						if (hasKey) {
+							content = `[read_file success] File ${p.uri.fsPath} page ${p.pageNumber} loaded in [ACTIVE FILES CONTEXT]. Do NOT read again — use edit_file to append this file's analysis to the deliverable .md.`;
+						} else {
+							content = `[read_file success] File ${p.uri.fsPath} page ${p.pageNumber} was pruned from active context. Re-read only if you need NEW content for the next .md section; otherwise edit_file the deliverable .md with what you already know.`;
+						}
+					} else if (m.name === 'read_files') {
+						const p = (m as any).params as BuiltinToolCallParams['read_files'];
+						const key = agentReadRegistryKey('read_files', p);
+						const hasKey = activeReadKeysSet ? activeReadKeysSet.has(key) : false;
+						console.log('[RAG][debug] checking read_files key:', key, 'hasKey:', hasKey);
+						if (hasKey) {
+							const paths = p.uris.map(u => u.fsPath).join(', ');
+							content = `[read_files success] Files [${paths}] page ${p.pageNumber} loaded in [ACTIVE FILES CONTEXT]. Do NOT read again — use edit_file to append analysis to the deliverable .md.`;
+						} else {
+							const paths = p.uris.map(u => u.fsPath).join(', ');
+							content = `[read_files success] Files [${paths}] page ${p.pageNumber} were pruned from active context. Re-read only for NEW .md sections; prefer edit_file on the deliverable .md.`;
+						}
+					}
+				}
 				simpleLLMMessages.push({
 					role: m.role,
-					content: m.content,
+					content: content,
 					name: m.name,
 					id: m.id,
 					rawParams: m.rawParams,
@@ -641,7 +674,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 			else if (m.role === 'user') {
 				simpleLLMMessages.push({
 					role: m.role,
-					content: m.content,
+					content: stripDiagramBlocksForLlm(m.content),
 				})
 			}
 		}
@@ -695,7 +728,199 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		const { disableSystemMessage } = this.mcodeSettingsService.state.globalSettings;
 		const fullSystemMessage = await this._generateChatMessagesSystemMessage(chatMode, specialToolFormat)
-		const systemMessage = disableSystemMessage ? '' : fullSystemMessage;
+		let systemMessage = disableSystemMessage ? '' : fullSystemMessage;
+
+		// 1. Find active read files
+		const activeReadKeys: string[] = [];
+		const activeReadKeysSet = new Set<string>();
+		const filesToLoad: { uri: URI; pageNumber: number; startLine: number | null; endLine: number | null }[] = [];
+
+		for (let i = chatMessages.length - 1; i >= 0; i--) {
+			const m = chatMessages[i];
+			if (m.role === 'tool' && m.type === 'success') {
+				if (m.name === 'read_file') {
+					const p = m.params as BuiltinToolCallParams['read_file'];
+					const key = agentReadRegistryKey('read_file', p);
+					if (!activeReadKeysSet.has(key)) {
+						activeReadKeysSet.add(key);
+						activeReadKeys.push(key);
+						filesToLoad.push({ uri: p.uri, pageNumber: p.pageNumber, startLine: p.startLine, endLine: p.endLine });
+					}
+				} else if (m.name === 'read_files') {
+					const p = m.params as BuiltinToolCallParams['read_files'];
+					const key = agentReadRegistryKey('read_files', p);
+					if (!activeReadKeysSet.has(key)) {
+						activeReadKeysSet.add(key);
+						activeReadKeys.push(key);
+						for (const uri of p.uris) {
+							filesToLoad.push({ uri: uri, pageNumber: p.pageNumber, startLine: null, endLine: null });
+						}
+					}
+				}
+			}
+		}
+
+		// Keep only the most recent N active read calls
+		const MAX_ACTIVE_READS = 5;
+		const slicedActiveKeys = activeReadKeys.slice(0, MAX_ACTIVE_READS);
+		const slicedActiveKeysSet = new Set(slicedActiveKeys);
+		console.log('[RAG][debug] slicedActiveKeysSet:', Array.from(slicedActiveKeysSet));
+
+		// Now collect unique file pages to load (since read_files has multiple files, we map uri+page to content)
+		type ActiveReadItem = 
+			| { type: 'read_file'; uri: URI; pageNumber: number; startLine: number | null; endLine: number | null }
+			| { type: 'read_files'; uris: URI[]; pageNumber: number };
+
+		const filePagesToLoad: ActiveReadItem[] = [];
+		const filePagesSet = new Set<string>();
+
+		for (let i = chatMessages.length - 1; i >= 0; i--) {
+			const m = chatMessages[i];
+			if (m.role === 'tool' && m.type === 'success') {
+				if (m.name === 'read_file') {
+					const p = m.params as BuiltinToolCallParams['read_file'];
+					const key = agentReadRegistryKey('read_file', p);
+					if (slicedActiveKeysSet.has(key)) {
+						const fileKey = `${p.uri.fsPath.toLowerCase()}::p${p.pageNumber}${p.startLine !== null || p.endLine !== null ? `::lines${p.startLine}-${p.endLine}` : ''}`;
+						if (!filePagesSet.has(fileKey)) {
+							filePagesSet.add(fileKey);
+							filePagesToLoad.push({ type: 'read_file', uri: p.uri, pageNumber: p.pageNumber, startLine: p.startLine, endLine: p.endLine });
+						}
+					}
+				} else if (m.name === 'read_files') {
+					const p = m.params as BuiltinToolCallParams['read_files'];
+					const key = agentReadRegistryKey('read_files', p);
+					if (slicedActiveKeysSet.has(key)) {
+						const combinedPaths = p.uris.map(u => u.fsPath.toLowerCase()).sort().join(',');
+						const fileKey = `read_files::${combinedPaths}::p${p.pageNumber}`;
+						if (!filePagesSet.has(fileKey)) {
+							filePagesSet.add(fileKey);
+							filePagesToLoad.push({ type: 'read_files', uris: p.uris, pageNumber: p.pageNumber });
+						}
+					}
+				}
+			}
+		}
+
+		// Fetch the content of each active file page
+		const activeFilesBlocks: string[] = [];
+		for (const f of filePagesToLoad) {
+			try {
+				if (f.type === 'read_file') {
+					await this.mcodeModelService.initializeModel(f.uri);
+					const { model } = await this.mcodeModelService.getModelSafe(f.uri);
+					if (model !== null) {
+						const startLineNumber = f.startLine === null ? 1 : f.startLine;
+						const fromStartOfFile = f.startLine === null || f.startLine <= 1;
+						let contents: string;
+						if (f.startLine === null && f.endLine === null) {
+							contents = model.getValue(EndOfLinePreference.LF);
+						} else {
+							const endLineNumber = f.endLine === null ? model.getLineCount() : f.endLine;
+							contents = model.getValueInRange({ startLineNumber, startColumn: 1, endLineNumber, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF);
+						}
+						// Strip header and diagram blocks
+						contents = stripFileHeaderForToolOutput(contents, fromStartOfFile);
+						contents = stripDiagramBlocksForLlm(contents);
+
+						// Slice to page size (16,000 chars)
+						const pageSize = 16000;
+						const fromIdx = pageSize * (f.pageNumber - 1);
+						const toIdx = pageSize * f.pageNumber - 1;
+						const pageContents = contents.slice(fromIdx, toIdx + 1);
+
+						const rangeStr = f.startLine !== null || f.endLine !== null ? `, lines ${startLineNumber}-${f.endLine === null ? 'end' : f.endLine}` : '';
+						activeFilesBlocks.push(`--- FILE: ${f.uri.fsPath} (page ${f.pageNumber}${rangeStr}) ---\n${pageContents}`);
+					}
+				} else if (f.type === 'read_files') {
+					const fileBlocks: string[] = [];
+					for (const uri of f.uris) {
+						try {
+							await this.mcodeModelService.initializeModel(uri);
+							const { model } = await this.mcodeModelService.getModelSafe(uri);
+							if (model !== null) {
+								let contents = model.getValue(EndOfLinePreference.LF);
+								contents = stripFileHeaderForToolOutput(contents, true);
+								contents = stripDiagramBlocksForLlm(contents);
+								fileBlocks.push(`${uri.fsPath}\n\`\`\`\n${contents}\n\`\`\``);
+							}
+						} catch (e) {
+							fileBlocks.push(`${uri.fsPath}\n\`\`\`\nError: ${e instanceof Error ? e.message : String(e)}\n\`\`\``);
+						}
+					}
+					const combined = fileBlocks.join('\n\n');
+					const pageSize = 16000; // MAX_READ_FILES_COMBINED_PAGE
+					const fromIdx = pageSize * (f.pageNumber - 1);
+					const toIdx = pageSize * f.pageNumber - 1;
+					const pageContents = combined.slice(fromIdx, toIdx + 1);
+
+					activeFilesBlocks.push(`--- FILES: [${f.uris.map(u => u.fsPath).join(', ')}] (page ${f.pageNumber}) ---\n${pageContents}`);
+				}
+			} catch (e) {
+				console.error(`Error loading active context file block:`, e);
+			}
+		}
+
+		let activeFilesSection = '';
+		if (activeFilesBlocks.length > 0) {
+			activeFilesSection = `\n\n[ACTIVE FILES CONTEXT]\nThe following files are currently loaded in your active workspace context:\n${activeFilesBlocks.join('\n\n')}\n\nUse this content to write or append to the user's deliverable .md (edit_file / rewrite_file). Do NOT re-read the same path/page if it is listed here. If a file was pruned from this list, you may read_file again only when you need new content for the next .md section — not to repeat exploration. After at most 2 read/search tools, your next tool MUST update the deliverable .md.`;
+		}
+
+		// Find relevant URIs for repository map (Opened files, Active file, and Recent reads)
+		const relevantURIs: URI[] = [];
+		const relevantPathsSet = new Set<string>();
+
+		const addURI = (uri: URI) => {
+			const key = uri.fsPath.toLowerCase();
+			if (!relevantPathsSet.has(key)) {
+				relevantPathsSet.add(key);
+				relevantURIs.push(uri);
+			}
+		};
+
+		// 1. Active file
+		const activeURI = this.editorService.activeEditor?.resource;
+		if (activeURI) {
+			addURI(activeURI);
+		}
+
+		// 2. Opened files
+		const openedModels = this.modelService.getModels().filter(m => m.isAttachedToEditor());
+		for (const m of openedModels) {
+			addURI(m.uri);
+		}
+
+		// 3. Recently read files
+		for (const f of filePagesToLoad) {
+			if (f.type === 'read_file') {
+				addURI(f.uri);
+			} else if (f.type === 'read_files') {
+				for (const uri of f.uris) {
+					addURI(uri);
+				}
+			}
+		}
+
+		// Generate the Repository Map
+		let repositoryMapSection = '';
+		try {
+			console.log('[RepositoryMap] Gathering codebase map signatures for relevant files:', relevantURIs.map(u => u.fsPath));
+			const repositoryMapContent = await this.repositoryMapService.getRepositoryMap(relevantURIs);
+			if (repositoryMapContent) {
+				console.log(`[RepositoryMap] Generated map size: ${repositoryMapContent.length} characters.`);
+				repositoryMapSection = `\n\n[REPOSITORY MAP]\nHere are the class/function signatures of files relevant to your current focus:\n${repositoryMapContent}`;
+			}
+		} catch (e) {
+			console.error('[RepositoryMap] Error generating repository map:', e);
+		}
+
+		if (systemMessage && repositoryMapSection) {
+			systemMessage += repositoryMapSection;
+		}
+
+		if (systemMessage && activeFilesSection) {
+			systemMessage += activeFilesSection;
+		}
 
 		const modelSelectionOptions = this.mcodeSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]
 
@@ -703,7 +928,7 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		const aiInstructions = this._getCombinedAIInstructions();
 		const isReasoningEnabled = getIsReasoningEnabledState('Chat', providerName, modelName, modelSelectionOptions, overridesOfModel)
 		const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName, { isReasoningEnabled, overridesOfModel })
-		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages)
+		const llmMessages = this._chatMessagesToSimpleMessages(chatMessages, slicedActiveKeysSet)
 		const maskedLLMMessages = llmMessages.map(m => ({
 			...m,
 			content: maskSensitiveSecrets(m.content)

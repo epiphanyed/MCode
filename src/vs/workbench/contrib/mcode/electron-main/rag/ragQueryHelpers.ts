@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------*/
 
 import { MetadataMode, type BaseNode } from 'llamaindex';
+import { stripDiagramBlocksForLlm } from '../../common/helpers/diagramBlockStripper.js';
 
 export interface CodeSymbolEntry {
 	startLine: number;
@@ -61,7 +62,7 @@ export function assignDocParentChunks(nodes: BaseNode[], maxParentChars = DOC_PA
 	for (const node of nodes) {
 		const metadata = node.metadata as Record<string, unknown>;
 		const header = getHeaderBreadcrumbFromMetadata(metadata) ?? '';
-		const text = node.getContent(MetadataMode.NONE);
+		const text = stripDiagramBlocksForLlm(node.getContent(MetadataMode.NONE));
 		const nodeId = String(node.id_);
 
 		const wouldExceed =
@@ -85,9 +86,9 @@ export function resolveDocDisplayText(node: BaseNode, docParentMap: Record<strin
 	const metadata = node.metadata as Record<string, unknown>;
 	const parentKey = metadata.parentKey ? String(metadata.parentKey) : undefined;
 	if (parentKey && docParentMap[parentKey]) {
-		return docParentMap[parentKey];
+		return stripDiagramBlocksForLlm(docParentMap[parentKey]);
 	}
-	return node.getContent(MetadataMode.NONE);
+	return stripDiagramBlocksForLlm(node.getContent(MetadataMode.NONE));
 }
 
 export function findEnclosingSymbol(

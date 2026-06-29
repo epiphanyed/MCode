@@ -3,13 +3,14 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import React, { JSX, useMemo, useState } from 'react'
+import React, { JSX, useCallback, useMemo, useState } from 'react'
 import { marked, MarkedToken, Token } from 'marked'
 
 import { convertToVscodeLang, detectLanguage } from '../../../../common/helpers/languageHelpers.js'
+import { gfmTaskItemId } from '../../../../common/helpers/taskPlanParser.js'
 import { BlockCodeApplyWrapper } from './ApplyBlockHoverButtons.js'
 import { DiagramContainer } from './DiagramContainer.js'
-import { useAccessor } from '../util/services.js'
+import { useAccessor, useChatThreadsState } from '../util/services.js'
 import { URI } from '../../../../../../../base/common/uri.js'
 import { isAbsolute } from '../../../../../../../base/common/path.js'
 import { separateOutFirstLine } from '../../../../common/helpers/util.js'
@@ -266,6 +267,42 @@ const paragraphToLatexSegments = (paragraphText: string) => {
 }
 
 
+const InteractiveTaskCheckbox = ({
+	text,
+	listIndex,
+	initialChecked,
+	chatMessageLocation,
+}: {
+	text: string;
+	listIndex: number;
+	initialChecked: boolean;
+	chatMessageLocation: ChatMessageLocation;
+}) => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+	useChatThreadsState() // re-render on thread state changes
+
+	const itemId = gfmTaskItemId(listIndex, text)
+	const { threadId, messageIdx } = chatMessageLocation
+	const checked = chatThreadsService.getTaskPlanItemChecked(threadId, messageIdx, itemId, initialChecked)
+
+	const onToggle = useCallback((e: React.MouseEvent) => {
+		e.stopPropagation()
+		chatThreadsService.toggleTaskPlanItem(threadId, messageIdx, itemId, initialChecked)
+	}, [chatThreadsService, threadId, messageIdx, itemId, initialChecked])
+
+	return (
+		<input
+			type='checkbox'
+			checked={checked}
+			onChange={() => { }}
+			onClick={onToggle}
+			className='cursor-pointer align-middle mr-1'
+		/>
+	)
+}
+
+
 export type RenderTokenOptions = { isApplyEnabled?: boolean, isLinkDetectionEnabled?: boolean }
 const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ...options }: { token: Token | string, inPTag?: boolean, codeURI?: URI, chatMessageLocation?: ChatMessageLocation, tokenIdx: string, } & RenderTokenOptions): React.ReactNode => {
 	const accessor = useAccessor()
@@ -423,8 +460,18 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 	}
 
 	if (t.type === 'list_item') {
-		return <li>
+		const taskToggle = chatMessageLocation ? (
+			<InteractiveTaskCheckbox
+				text={t.text}
+				listIndex={parseInt(tokenIdx.split('-').pop() ?? '0', 10) || 0}
+				initialChecked={!!t.checked}
+				chatMessageLocation={chatMessageLocation}
+			/>
+		) : (
 			<input type='checkbox' checked={t.checked} readOnly />
+		)
+		return <li>
+			{taskToggle}
 			<span>
 				<ChatMarkdownRender chatMessageLocation={chatMessageLocation} string={t.text} inPTag={true} codeURI={codeURI} {...options} />
 			</span>
@@ -439,7 +486,16 @@ const RenderToken = ({ token, inPTag, codeURI, chatMessageLocation, tokenIdx, ..
 				{t.items.map((item, index) => (
 					<li key={index}>
 						{item.task && (
-							<input type='checkbox' checked={item.checked} readOnly />
+							chatMessageLocation ? (
+								<InteractiveTaskCheckbox
+									text={item.text}
+									listIndex={index}
+									initialChecked={!!item.checked}
+									chatMessageLocation={chatMessageLocation}
+								/>
+							) : (
+								<input type='checkbox' checked={item.checked} readOnly />
+							)
 						)}
 						<span>
 							<ChatMarkdownRender chatMessageLocation={chatMessageLocation} string={item.text} inPTag={true} {...options} />

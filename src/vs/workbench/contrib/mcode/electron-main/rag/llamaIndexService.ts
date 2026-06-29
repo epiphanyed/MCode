@@ -95,6 +95,8 @@ import {
     type LocalStoreLayout,
 } from './localStorePaths.js';
 import { localVectorRecordToNode, nodeToLocalVectorRecord } from './localVectorRecordMapper.js';
+import { ragLogBody, ragLogElapsed, ragLogJson, ragLogNodes, ragLogStage } from '../../common/helpers/ragDebugLog.js';
+import { stripDiagramBlocksForLlm } from '../../common/helpers/diagramBlockStripper.js';
 
 const MANIFEST_VERSION = 6;
 const EMBED_BATCH_SIZE = 32;
@@ -217,8 +219,6 @@ export class LlamaIndexService {
     private indexBuildTreeSitterPass: TreeSitterIndexPass = 'off';
     private indexFileFailureCount = 0;
     private indexFileFailureSamples: string[] = [];
-    private static readonly INDEX_FAIL_LOG_LIMIT = 5;
-
     private currentPhase: RagIndexPhase = 'idle';
     private filesDone = 0;
     private filesTotal = 0;
@@ -227,6 +227,7 @@ export class LlamaIndexService {
     private lastError: string | null = null;
     private lastIncrementalSync: RagIncrementalSyncEvent | null = null;
     private indexBuildInProgress = false;
+    private indexReadyWaiters: Array<(ready: boolean) => void> = [];
     private localIndexBuildDeferHnsw = false;
 
     /** Yield the Electron main thread so IPC/UI can process events. */
@@ -318,8 +319,75 @@ export class LlamaIndexService {
             } finally {
                 this.indexBuildInProgress = false;
                 this.localIndexBuildDeferHnsw = false;
+                this.signalIndexReady();
             }
         })();
+    }
+
+    private signalIndexReady(): void {
+        const ready = Boolean(this.localVectorStore || this.milvusStore);
+        const waiters = this.indexReadyWaiters.splice(0);
+        for (const resolve of waiters) {
+            resolve(ready);
+        }
+        if (ready) {
+            void this.warmQueryPipeline();
+        }
+    }
+
+    private warmingPipeline = false;
+
+    /** Preload Ollama embedding model and exercise HNSW so the first chat query is faster. */
+    private async warmQueryPipeline(): Promise<void> {
+        if (this.warmingPipeline) {
+            return;
+        }
+        this.warmingPipeline = true;
+        const t0 = Date.now();
+        try {
+            ragLogStage('warm', 'preloading embedding + search pipeline…');
+            const vec = await Settings.embedModel.getTextEmbedding('warmup');
+            ragLogElapsed('warm', 'embedding', t0);
+            if (this.localVectorStore && vec.length > 0) {
+                await this.localVectorStore.similaritySearch(vec, {
+                    topK: 1,
+                    onBatchScanned: () => this.yieldToEventLoop(),
+                });
+                ragLogElapsed('warm', 'search pipeline', t0);
+            }
+            ragLogStage('warm', 'ready for first query');
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            ragLogStage('warm', `skipped (${msg})`);
+        }
+    }
+
+    /** Wait until background index init/load completes and a store is available (or gives up). */
+    public waitForIndexReady(timeoutMs = 120_000): Promise<boolean> {
+        if (this.localVectorStore || this.milvusStore) {
+            return Promise.resolve(true);
+        }
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (ready: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                const idx = this.indexReadyWaiters.indexOf(onReady);
+                if (idx >= 0) {
+                    this.indexReadyWaiters.splice(idx, 1);
+                }
+                resolve(ready || Boolean(this.localVectorStore || this.milvusStore));
+            };
+            const timer = setTimeout(() => finish(false), timeoutMs);
+            const onReady = (ready: boolean) => finish(ready);
+            this.indexReadyWaiters.push(onReady);
+            if (!this.indexBuildInProgress) {
+                finish(Boolean(this.localVectorStore || this.milvusStore));
+            }
+        });
     }
 
     private readonly _onIndexProgress = new Emitter<RagIndexProgressEvent>();
@@ -687,14 +755,17 @@ export class LlamaIndexService {
 
     private recordIndexFileFailure(filePath: string, stage: 'read' | 'chunk', err: unknown): void {
         this.indexFileFailureCount += 1;
-        if (this.indexFileFailureSamples.length < LlamaIndexService.INDEX_FAIL_LOG_LIMIT) {
-            this.indexFileFailureSamples.push(`${stage}:${path.basename(filePath)}`);
-        }
-        if (this.indexFileFailureCount <= LlamaIndexService.INDEX_FAIL_LOG_LIMIT) {
-            console.warn(`[RAG] Failed to ${stage} file ${filePath}:`, err);
-        } else if (this.indexFileFailureCount === LlamaIndexService.INDEX_FAIL_LOG_LIMIT + 1) {
-            console.warn('[RAG] Further per-file index failures suppressed; see summary at build end.');
-        }
+        this.indexFileFailureSamples.push(`${stage}:${filePath}`);
+        console.warn(`[RAG] Failed to ${stage} file ${filePath}:`, err);
+    }
+
+    private logRetrievedNodes(stage: string, label: string, nodes: RetrievedNode[]): void {
+        ragLogNodes(stage, label, nodes, n => n.node.getContent(MetadataMode.NONE));
+    }
+
+    private logEmbedQuery(queryText: string, denseVector: number[]): void {
+        ragLogStage('embed', `dims=${denseVector.length}`);
+        ragLogBody('embed', 'query', queryText);
     }
 
     private logIndexFileFailureSummary(totalFiles: number): void {
@@ -1034,16 +1105,20 @@ export class LlamaIndexService {
 
         if (this.activeIndexType === 'milvus' && this.milvusStore) {
             const denseVector = await Settings.embedModel.getTextEmbedding(queryText);
+            this.logEmbedQuery(queryText, denseVector);
             const hits = await this.milvusStore.hybridSearch(
                 queryText,
                 denseVector,
                 retrieveTopK,
                 partitions,
             );
-            return Promise.all(hits.map(async (hit, index) => ({
+            ragLogStage('retrieve', `milvus hits=${hits.length} partitions=${JSON.stringify(partitions ?? null)}`);
+            const nodes = await Promise.all(hits.map(async (hit, index) => ({
                 node: await this.nodeFromMilvusHit(hit),
                 score: typeof hit.score === 'number' ? hit.score : (hits.length - index),
             })));
+            this.logRetrievedNodes('retrieve', 'nodes', nodes);
+            return nodes;
         }
 
         if (!this.localVectorStore) {
@@ -1051,22 +1126,34 @@ export class LlamaIndexService {
         }
 
         const localRetrieveTopK = computeLocalRouterRetrieveTopK(retrieveTopK, routeTargets, useRouter);
+        const tEmbed = Date.now();
         const denseVector = await Settings.embedModel.getTextEmbedding(queryText);
+        ragLogElapsed('embed', 'ollama', tEmbed);
+        this.logEmbedQuery(queryText, denseVector);
         const docTypes = useRouter ? targetsToLocalDocTypes(routeTargets) : undefined;
+        const tSearch = Date.now();
         const hits = await this.localVectorStore.similaritySearch(denseVector, {
             topK: localRetrieveTopK,
             docTypes,
             onBatchScanned: () => this.yieldToEventLoop(),
         });
-        const scored: RetrievedNode[] = hits.map((hit, index) => ({
+        ragLogElapsed('search', 'similaritySearch', tSearch);
+        const scored: RetrievedNode[] = hits.map((hit) => ({
             node: localVectorRecordToNode(hit.record),
             score: hit.score,
         }));
 
-        if (useRouter) {
-            return filterRetrievedByRoute(scored, routeTargets, retrieveTopK);
-        }
-        return scored.slice(0, retrieveTopK);
+        const afterRoute = useRouter
+            ? filterRetrievedByRoute(scored, routeTargets, retrieveTopK)
+            : scored.slice(0, retrieveTopK);
+        ragLogStage(
+            'retrieve',
+            `local route=${JSON.stringify(routeTargets)} retrieveTopK=${localRetrieveTopK} `
+            + `docTypes=${JSON.stringify(docTypes ?? null)} rawHits=${hits.length} afterRoute=${afterRoute.length}`,
+        );
+        this.logRetrievedNodes('retrieve', 'nodes', afterRoute);
+
+        return afterRoute;
     }
 
     private async assembleOrchestratedContext(
@@ -1080,28 +1167,48 @@ export class LlamaIndexService {
         }
 
         const routeTargets = orch.useRouter ? routeQueryTargets(queryText) : ['all' as RagRouteTarget];
+        ragLogJson('route', 'targets', routeTargets);
+
         const subQueries = await this.resolveSubQuestions(queryText, orch);
+        ragLogJson('subq', 'count', subQueries.length);
+        for (let i = 0; i < subQueries.length; i++) {
+            ragLogBody('subq', `query[${i}]`, subQueries[i]);
+        }
 
         let scored: RetrievedNode[] = [];
         for (const subQ of subQueries) {
             const nodes = await this.retrieveVectorNodes(subQ, opts, routeTargets, orch.useRouter);
             scored.push(...nodes);
         }
+        const beforeDedupe = scored.length;
         scored = dedupeRetrievedNodes(scored);
 
         if (scored.length === 0) {
+            ragLogStage('dedupe', `${beforeDedupe} -> 0 (empty, aborting)`);
             return null;
         }
+        ragLogStage('dedupe', `${beforeDedupe} -> ${scored.length}`);
+        this.logRetrievedNodes('dedupe', 'nodes', scored);
 
         if (opts.useReranker && scored.length > 1) {
             const rerankPool = Math.max(opts.finalTopK * 2, opts.finalTopK);
+            const beforeRerank = scored.length;
             scored = rerankRetrievedNodes(queryText, scored, rerankPool);
+            ragLogStage('rerank', `pool=${rerankPool} ${beforeRerank} -> ${scored.length}`);
+            this.logRetrievedNodes('rerank', 'nodes', scored);
+        } else {
+            ragLogStage('rerank', 'skipped');
         }
+
+        const beforeMmr = scored.length;
         scored = applyMMRDiversity(scored, opts.finalTopK);
+        ragLogStage('mmr', `finalTopK=${opts.finalTopK} ${beforeMmr} -> ${scored.length}`);
+        this.logRetrievedNodes('mmr', 'nodes', scored);
 
         const sections: string[] = [];
         let budgetRemaining = opts.assemblyMaxChars ?? Number.POSITIVE_INFINITY;
         const ORCHESTRATION_EXPAND_MIN_CHARS = 400;
+        ragLogStage('assemble', `assemblyMaxChars=${opts.assemblyMaxChars ?? 'unlimited'} budgetRemaining=${budgetRemaining}`);
 
         const formatted = await Promise.all(
             scored.map(async result => {
@@ -1110,7 +1217,9 @@ export class LlamaIndexService {
             }),
         );
         const topKBlock = formatted.join('\n\n');
+        ragLogBody('format', 'topKBlock', topKBlock);
         budgetRemaining = appendSectionWithinBudget(sections, topKBlock, budgetRemaining);
+        ragLogStage('assemble', `after topK budgetRemaining=${budgetRemaining}`);
 
         if (orch.useGraphExpand && budgetRemaining >= ORCHESTRATION_EXPAND_MIN_CHARS) {
             const graphSnippets = await expandRetrievalWithGraph(
@@ -1120,66 +1229,144 @@ export class LlamaIndexService {
                 orch.graphExpandMax,
                 orch.graphExpandHops,
             );
+            ragLogStage('graph', `snippets=${graphSnippets.length} hops=${orch.graphExpandHops} max=${orch.graphExpandMax}`);
             if (graphSnippets.length > 0) {
                 const graphBlock = graphSnippets.map(formatGraphExpandedSnippet).join('\n\n');
+                ragLogBody('graph', 'block', graphBlock);
                 budgetRemaining = appendSectionWithinBudget(sections, graphBlock, budgetRemaining);
+                ragLogStage('assemble', `after graph budgetRemaining=${budgetRemaining}`);
             }
+        } else {
+            ragLogStage('graph', `skipped enabled=${orch.useGraphExpand} budget=${budgetRemaining}`);
         }
 
         if (orch.useDocLinkedCode && budgetRemaining >= ORCHESTRATION_EXPAND_MIN_CHARS) {
             const linkedPaths = collectLinkedFilesFromDocNodes(scored, this.workspaceRoot);
+            ragLogStage('doclink', `linkedPaths=${linkedPaths.length} max=${orch.docLinkedMax}`);
             if (linkedPaths.length > 0) {
+                ragLogJson('doclink', 'paths', linkedPaths);
                 const linkedSnippets = await buildLinkedCodeSnippets(
                     linkedPaths,
                     this.codeSymbolMap,
                     (filePath, startLine, endLine) => this.readFileLineRange(filePath, startLine, endLine),
                     orch.docLinkedMax,
                 );
+                ragLogStage('doclink', `snippets=${linkedSnippets.length}`);
                 if (linkedSnippets.length > 0) {
                     const linkedBlock = linkedSnippets.map(formatLinkedCodeSnippet).join('\n\n');
+                    ragLogBody('doclink', 'block', linkedBlock);
                     appendSectionWithinBudget(sections, linkedBlock, budgetRemaining);
                 }
             }
+        } else {
+            ragLogStage('doclink', `skipped enabled=${orch.useDocLinkedCode} budget=${budgetRemaining}`);
         }
 
-        return sections.filter(Boolean).join('\n\n');
+        const result = sections.filter(Boolean).join('\n\n');
+        ragLogBody('assemble', 'vectorContext', result);
+        return result;
     }
 
     public async queryContext(queryText: string, options?: RagQueryOptions): Promise<string> {
-        const gitContext = this.workspaceRoot
-            ? await buildGitDynamicContext({ workspaceRoot: this.workspaceRoot, query: queryText })
-            : null;
+        const t0 = Date.now();
+        ragLogStage('query', 'received');
 
         const opts = { ...defaultRagQueryOptions, ...options };
         this.queryCompactMode = opts.ragCompactMode ?? false;
         let orch = mergeOrchestratorOptions(opts);
+        const orchBeforeIntent = { ...orch };
         orch = applyIntentOrchestration(queryText, orch, opts.ragIntentOrchestration !== false);
+        if (JSON.stringify(orchBeforeIntent) !== JSON.stringify(orch)) {
+            ragLogJson('route', 'intentOrchestration', { before: orchBeforeIntent, after: orch });
+        }
         const useOrchestrator = options?.useOrchestrator !== false;
 
+        const indexStatus = this.getIndexStatus();
+        const statsPromise = this.localVectorStore
+            ? Promise.all([
+                this.localVectorStore.getChunkCount(),
+                Promise.resolve(this.localVectorStore.getHnswVectorCount()),
+                this.localVectorStore.getDocTypeCounts(),
+            ]).catch(() => [undefined, undefined, undefined] as const)
+            : Promise.resolve([undefined, undefined, undefined] as const);
+
+        const gitContext = this.workspaceRoot
+            ? await buildGitDynamicContext({ workspaceRoot: this.workspaceRoot, query: queryText })
+            : null;
+        ragLogElapsed('query', 'gitContext', t0);
+
+        void statsPromise.then(([dbChunks, hnswVectors, docTypeCounts]) => {
+            ragLogElapsed('query', 'indexStats', t0);
+            ragLogJson('query', 'docTypeCounts', docTypeCounts ?? null);
+            const routeTargets = orch.useRouter ? routeQueryTargets(queryText) : ['all' as RagRouteTarget];
+            ragLogStage(
+                'query',
+                `start indexType=${this.activeIndexType} route=${JSON.stringify(routeTargets)} `
+                + `manifestChunks=${indexStatus.chunkCount} dbChunks=${dbChunks ?? 'n/a'} hnsw=${hnswVectors ?? 'n/a'} `
+                + `embed=${this.currentEmbeddingConfig.provider}/${this.currentEmbeddingConfig.model}`,
+            );
+        });
+
+        ragLogBody('query', 'input', queryText);
+        ragLogJson('config', 'queryOptions', {
+            similarityTopK: opts.similarityTopK,
+            finalTopK: opts.finalTopK,
+            useReranker: opts.useReranker,
+            useOrchestrator,
+            assemblyMaxChars: opts.assemblyMaxChars,
+            ragCompactMode: opts.ragCompactMode,
+        });
+        ragLogJson('config', 'orchestrator', orch);
+
+        if (gitContext) {
+            ragLogBody('git', 'dynamicContext', gitContext);
+        } else {
+            ragLogStage('git', 'dynamicContext: (empty)');
+        }
+
         try {
+            const tRetrieve = Date.now();
+            ragLogStage('query', 'retrieve+assemble start');
             const vectorContext = useOrchestrator
                 ? await this.assembleOrchestratedContext(queryText, opts, orch)
                 : await this.assembleLegacyContext(queryText, opts);
+            ragLogElapsed('query', 'retrieve+assemble', tRetrieve);
+            ragLogElapsed('query', 'total', t0);
 
             if (vectorContext) {
-                return gitContext ? `${gitContext}\n\n${vectorContext}` : vectorContext;
+                const combined = gitContext ? `${gitContext}\n\n${vectorContext}` : vectorContext;
+                ragLogStage('query', `ok vectorChars=${vectorContext.length} gitChars=${gitContext?.length ?? 0} totalChars=${combined.length}`);
+                ragLogBody('query', 'finalContext', combined);
+                return combined;
+            }
+            ragLogStage(
+                'query',
+                `empty vector context indexType=${this.activeIndexType} `
+                + `localStore=${Boolean(this.localVectorStore)} milvus=${Boolean(this.milvusStore)}`,
+            );
+            if (gitContext) {
+                ragLogBody('query', 'finalContext (git only)', gitContext);
             }
             return gitContext ?? "No context found. RAG index has not been initialized yet.";
         } catch (err) {
-            console.error('[RAG] Retrieval failed:', err);
+            ragLogElapsed('query', 'failed', t0);
+            console.error('[RAG][query] retrieval failed:', err);
             return gitContext ?? "No context found. RAG index has not been initialized yet.";
         }
     }
 
     /** Pre-orchestrator retrieval path (no router / graph / sub-questions). */
     private async assembleLegacyContext(queryText: string, opts: Required<RagQueryOptions>): Promise<string | null> {
+        ragLogStage('legacy', 'path=legacy (no orchestrator stages)');
         if (this.activeIndexType === 'milvus' && this.milvusStore) {
             const denseVector = await Settings.embedModel.getTextEmbedding(queryText);
+            this.logEmbedQuery(queryText, denseVector);
             const hits = await this.milvusStore.hybridSearch(
                 queryText,
                 denseVector,
                 opts.useReranker ? opts.similarityTopK : opts.finalTopK,
             );
+            ragLogStage('retrieve', `milvus hits=${hits.length}`);
             if (hits.length === 0) {
                 return null;
             }
@@ -1187,43 +1374,57 @@ export class LlamaIndexService {
                 node: await this.nodeFromMilvusHit(hit),
                 score: typeof hit.score === 'number' ? hit.score : (hits.length - index),
             })));
+            this.logRetrievedNodes('retrieve', 'nodes', scored);
             if (opts.useReranker && scored.length > 1) {
                 const rerankPool = Math.max(opts.finalTopK * 2, opts.finalTopK);
+                const before = scored.length;
                 scored = rerankRetrievedNodes(queryText, scored, rerankPool);
+                ragLogStage('rerank', `${before} -> ${scored.length}`);
             }
             scored = applyMMRDiversity(scored, opts.finalTopK);
+            ragLogStage('mmr', `finalTopK=${opts.finalTopK} nodes=${scored.length}`);
             const formatted = await Promise.all(
                 scored.map(async result => {
                     const displayContent = await this.resolveDisplayContent(result.node);
                     return this.formatNodeContext(result.node, displayContent);
                 }),
             );
-            return formatted.join('\n\n');
+            const result = formatted.join('\n\n');
+            ragLogBody('assemble', 'legacy vectorContext', result);
+            return result;
         }
 
         if (!this.localVectorStore) {
+            ragLogStage('legacy', 'no local vector store');
             return null;
         }
 
         const denseVector = await Settings.embedModel.getTextEmbedding(queryText);
+        this.logEmbedQuery(queryText, denseVector);
+        const topK = opts.useReranker ? opts.similarityTopK : opts.finalTopK;
         const hits = await this.localVectorStore.similaritySearch(denseVector, {
-            topK: opts.useReranker ? opts.similarityTopK : opts.finalTopK,
+            topK,
             onBatchScanned: () => this.yieldToEventLoop(),
         });
+        ragLogStage('retrieve', `local hits=${hits.length} topK=${topK}`);
         if (hits.length === 0) {
             return null;
         }
 
-        let scored: RetrievedNode[] = hits.map((hit, index) => ({
+        let scored: RetrievedNode[] = hits.map((hit) => ({
             node: localVectorRecordToNode(hit.record),
             score: hit.score,
         }));
+        this.logRetrievedNodes('retrieve', 'nodes', scored);
 
         if (opts.useReranker && scored.length > 1) {
             const rerankPool = Math.max(opts.finalTopK * 2, opts.finalTopK);
+            const before = scored.length;
             scored = rerankRetrievedNodes(queryText, scored, rerankPool);
+            ragLogStage('rerank', `${before} -> ${scored.length}`);
         }
         scored = applyMMRDiversity(scored, opts.finalTopK);
+        ragLogStage('mmr', `finalTopK=${opts.finalTopK} nodes=${scored.length}`);
 
         const formatted = await Promise.all(
             scored.map(async result => {
@@ -1231,7 +1432,9 @@ export class LlamaIndexService {
                 return this.formatNodeContext(result.node, displayContent);
             }),
         );
-        return formatted.join('\n\n');
+        const result = formatted.join('\n\n');
+        ragLogBody('assemble', 'legacy vectorContext', result);
+        return result;
     }
 
     private shouldIndexFile(filePath: string): boolean {
@@ -1426,9 +1629,10 @@ export class LlamaIndexService {
             const linkedFiles = path.extname(normalizedPath).toLowerCase() === '.md'
                 ? extractMarkdownLinkedFiles(content, normalizedPath, this.workspaceRoot)
                 : [];
+            const docText = stripDiagramBlocksForLlm(content);
             const doc = new Document({
                 id_: getChunkDocId(normalizedPath, 0),
-                text: content,
+                text: docText,
                 metadata: { filePath: normalizedPath, fileName, docType: 'doc_chunk' },
             });
             const nodes = await mdParser.getNodesFromDocuments([doc]);
@@ -2705,7 +2909,7 @@ export class LlamaIndexService {
         if (this.queryCompactMode && docType === 'code_chunk') {
             return compactCodeContent(text);
         }
-        return text;
+        return stripDiagramBlocksForLlm(text);
     }
 
     public getRelatedDependencies(filePath: string, maxResults = 8): RagRelatedDependency[] {

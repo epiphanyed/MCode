@@ -116,6 +116,12 @@ class VoidRagBrowserService implements IVoidRagService {
 
 	}
 
+	async waitForIndexReady(timeoutMs?: number): Promise<boolean> {
+
+		return this.voidRag.waitForIndexReady(timeoutMs);
+
+	}
+
 	async getRelatedDependencies(filePath: string, maxResults?: number): Promise<RagRelatedDependency[]> {
 
 		return this.voidRag.getRelatedDependencies(filePath, maxResults);

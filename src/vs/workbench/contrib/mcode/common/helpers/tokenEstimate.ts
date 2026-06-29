@@ -18,8 +18,8 @@ export function estimateTokenCount(text: string): number {
 			other += 1;
 		}
 	}
-	return Math.ceil(cjk / 1.5 + other / 4);
+	return Math.ceil(cjk / 1.2 + other / 3.0);
 }
 
 /** Minimum chars to retain after context trim (~500 tokens). */
-export const MIN_RETAINED_CHARS = 500 * 4;
+export const MIN_RETAINED_CHARS = 500 * 3;

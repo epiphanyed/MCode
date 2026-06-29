@@ -23,7 +23,10 @@ export const MAX_DIRSTR_RESULTS_TOTAL_BEGINNING = 100
 export const MAX_DIRSTR_RESULTS_TOTAL_TOOL = 100
 
 // tool info
-export const MAX_FILE_CHARS_PAGE = 8_000
+export const MAX_FILE_CHARS_PAGE = 16_000
+/** Max combined chars per read_files page (fixed cap; not multiplied by file count). */
+export const MAX_READ_FILES_COMBINED_PAGE = MAX_FILE_CHARS_PAGE
+export const MAX_READ_FILES_BATCH = 8
 export const MAX_CHILDREN_URIs_PAGE = 500
 
 /** @file staging: summary mode limits (CTX-B5). */
@@ -127,7 +130,11 @@ ${searchReplaceBlockTemplate}
 
 4. Each ORIGINAL text must be DISJOINT from all other ORIGINAL text.
 
-5. This field is a STRING (not an array).`
+5. For markdown (.md) files: read_file first, then copy heading/list lines verbatim from the file into ORIGINAL. Do not guess markers — if the file uses \`#\` or \`##\`, do not use \`-\` in ORIGINAL (and vice versa).
+
+6. Do not wrap ORIGINAL or UPDATED content in triple-backtick code fences inside the SEARCH/REPLACE blocks.
+
+7. This field is a STRING (not an array).`
 
 
 // ======================================================== tools ========================================================
@@ -164,8 +171,10 @@ const uriParam = (object: string) => ({
 })
 
 const paginationParam = {
-	page_number: { description: 'Optional. The page number of the result. Default is 1.' }
+	page_number: { description: 'Required when continuing pagination. Use 1 for the first page (default). If the previous result contained "(more on next page...)", you MUST call the same tool again with page_number = previous page + 1 and the same parameters as the previous call (same uri, uris, or search query).' }
 } as const
+
+const readFilePaginationRule = `If the result ends with "(more on next page...)", you MUST immediately call read_file again with the SAME uri and page_number set to the next page (2, then 3, …) until that marker disappears. Do NOT switch to other files or tools until you have read all pages of the file you are analyzing.`
 
 
 
@@ -201,11 +210,22 @@ export const builtinTools: {
 
 	read_file: {
 		name: 'read_file',
-		description: `Returns full contents of a given file.`,
+		description: `Returns contents of a single file (or a specific line range if start_line and end_line are provided). Copyright/license headers and mermaid/diagram blocks are omitted. When checking class/function definitions whose line ranges are visible in the [REPOSITORY MAP], always specify the exact start_line and end_line to load only that function's code and avoid loading the entire file, saving a massive amount of context tokens. ${readFilePaginationRule}`,
 		params: {
 			...uriParam('file'),
-			start_line: { description: 'Optional. Do NOT fill this field in unless you were specifically given exact line numbers to search. Defaults to the beginning of the file.' },
-			end_line: { description: 'Optional. Do NOT fill this field in unless you were specifically given exact line numbers to search. Defaults to the end of the file.' },
+			start_line: { description: 'Optional. The start line number (1-indexed, inclusive) of the range to read. If you saw the function\'s line range in the [REPOSITORY MAP], specify this to load only that function body.' },
+			end_line: { description: 'Optional. The end line number (1-indexed, inclusive) of the range to read. If you saw the function\'s line range in the [REPOSITORY MAP], specify this to load only that function body.' },
+			...paginationParam,
+		},
+	},
+
+	read_files: {
+		name: 'read_files',
+		description: `Read multiple files in one call. Prefer this when comparing or inspecting 2+ related files (e.g. header pairs). Copyright/license headers and mermaid/diagram blocks are stripped automatically. Max ${MAX_READ_FILES_BATCH} paths per call.
+
+PAGINATION (required): Results are capped at ${MAX_READ_FILES_COMBINED_PAGE} combined chars per page. If the result ends with "(more on next page...)", you MUST call read_files again with the EXACT SAME uris array and page_number incremented (2, then 3, …) until the marker is gone. Do NOT read different files or call other tools until all pages for the current uris are fetched.`,
+		params: {
+			uris: { description: `JSON array of full file paths, e.g. ["src/Foo.h", "src/FooUtils.h"]. Newline-separated paths are also accepted.` },
 			...paginationParam,
 		},
 	},
@@ -421,7 +441,12 @@ const systemToolsXMLPrompt = (chatMode: ChatMode, mcpTools: InternalToolInfo[] |
     - After you write the tool call, you must STOP and WAIT for the result.
     - All parameters are REQUIRED unless noted otherwise.
     - You are only allowed to output ONE tool call, and it must be at the END of your response.
-    - Your tool call will be executed immediately, and the results will appear in the following user message.`)
+    - Your tool call will be executed immediately, and the results will appear in the following user message.
+
+    Pagination for read_file / read_files:
+    - When ANY read_file or read_files result ends with "(more on next page...)", your VERY NEXT tool call MUST be the same tool with the SAME path(s) and page_number = previous page + 1.
+    - Do NOT analyze, edit, or read unrelated paths until every page of the current read is complete (no "(more on next page...)" in the last read result).
+    - Treat missing pages as incomplete context — never assume the truncated snippet is the full file.`)
 
 	return `\
     ${toolXMLDefinitions}
@@ -494,9 +519,24 @@ ${directoryStr}
 
 	if (mode === 'agent') {
 		details.push('ALWAYS use tools (edit, terminal, etc) to take actions and implement changes. For example, if you would like to edit a file, you MUST use a tool.')
-		details.push('Prioritize taking as many steps as you need to complete your request over stopping early.')
-		details.push(`You will OFTEN need to gather context before making a change. Do not immediately make a change unless you have ALL relevant context.`)
-		details.push(`ALWAYS have maximal certainty in a change BEFORE you make it. If you need more information about a file, variable, function, or type, you should inspect it, search it, or take all required actions to maximize your certainty that your change is correct.`)
+		details.push('Prioritize completing the user\'s deliverable over open-ended exploration. Stop gathering when you have enough to write the next section.')
+		details.push(`**Task breakdown (for multi-step work):** Before a large analysis or implementation, output a short task plan the user can track in the UI:
+- Use a heading line \`任务分解\` or \`Task Plan\`, then a markdown task list with \`- [ ]\` per step (use \`- [x]\` when you believe a step is done).
+- Example:
+  任务分解：
+  - [ ] Create outline .md
+  - [ ] Analyze core parser classes
+  - [ ] Summarize integration points
+- Keep 3–8 concrete steps; update checkboxes as you progress.`)
+		details.push(`**Incremental markdown deliverables (required for analysis / documentation tasks):** When the user asks you to analyze code and output a .md file (or any written report):
+- Do NOT wait until you have read the whole codebase or "ALL" related files. Never plan to write the entire document only at the end.
+- Workflow: read at most 1–2 related files (or one read_files batch) → **immediately** use rewrite_file (first time) or edit_file (append) on the target .md with that group's findings (classes, flow, notes) → then read the next small group → append again.
+- If the user names an output path (e.g. \`代码分析\\svg.md\`), that file IS the deliverable: create it early (even a skeleton outline) and keep appending sections.
+- **Hard rule:** after at most **2 consecutive** read/search/list tools without writing to the deliverable .md, your **next** tool call MUST be edit_file or rewrite_file on that .md.
+- If a read result says it was loaded into [ACTIVE FILES CONTEXT], or [already read], do **not** read the same path/page again — use what you have and write into the .md.
+- Include mermaid diagrams inside the .md as you go; do not defer all diagrams to the final step.
+- When enough sections exist to answer the user, stop reading new files and finalize the .md.`)
+		details.push(`For code edits (not documentation): gather context for the specific change, then edit. You do not need every related file in the repo first.`)
 		details.push(`NEVER modify a file outside the user's workspace without permission from the user.`)
 	}
 

@@ -56,6 +56,56 @@ function findDesiredPathFromLocalPath(localDesiredPath, currentPath) {
 	return globalDesiredPath;
 }
 
+/** Recursively copy react/out into gulp compile output so code.bat picks up UI changes. */
+function copyDirSync(src, dest) {
+	fs.mkdirSync(dest, { recursive: true });
+	for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+		const srcPath = path.join(src, entry.name);
+		const destPath = path.join(dest, entry.name);
+		if (entry.isDirectory()) {
+			copyDirSync(srcPath, destPath);
+		} else {
+			fs.copyFileSync(srcPath, destPath);
+		}
+	}
+}
+
+function findRepoRootFromHere() {
+	let currentPath = __dirname;
+	while (true) {
+		if (fs.existsSync(path.join(currentPath, 'product.json'))) {
+			return currentPath;
+		}
+		const parentDir = path.dirname(currentPath);
+		if (parentDir === currentPath) {
+			return undefined;
+		}
+		currentPath = parentDir;
+	}
+}
+
+function syncReactBuildToCompiledOut() {
+	const localOut = path.join(__dirname, 'out');
+	if (!fs.existsSync(localOut)) {
+		console.warn('[buildreact] Local react/out missing; skip sync.');
+		return;
+	}
+	const repoRoot = findRepoRootFromHere();
+	if (!repoRoot) {
+		console.warn('[buildreact] Could not find repo root; skip sync to compiled out/.');
+		return;
+	}
+	const compiledOut = path.join(repoRoot, 'out', 'vs', 'workbench', 'contrib', 'mcode', 'browser', 'react', 'out');
+	const compiledOutParent = path.dirname(compiledOut);
+	if (!fs.existsSync(path.join(repoRoot, 'out'))) {
+		console.warn('[buildreact] Compiled out/ not found — run gulp compile once. Dev launch will use stale UI until then.');
+		return;
+	}
+	fs.mkdirSync(compiledOutParent, { recursive: true });
+	copyDirSync(localOut, compiledOut);
+	console.log(`[buildreact] Synced react/out → ${compiledOut}`);
+}
+
 // hack to refresh styles automatically
 function saveStylesFile() {
 	setTimeout(() => {
@@ -149,6 +199,8 @@ if (isWatch) {
 
 	// Run tsup once
 	execSync('npx tsup', { stdio: 'inherit' });
+
+	syncReactBuildToCompiledOut();
 
 	console.log('✅ Build complete!');
 }

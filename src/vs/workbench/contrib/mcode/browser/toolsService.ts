@@ -16,9 +16,11 @@ import { computeDirectoryTree1Deep, IDirectoryStrService, stringifyDirectoryTree
 import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/common/markers.js'
 import { timeout } from '../../../../base/common/async.js'
 import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
-import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
+import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_READ_FILES_BATCH, MAX_READ_FILES_COMBINED_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
 import { IVoidSettingsService } from '../common/mcodeSettingsService.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
+import { stripFileHeaderForToolOutput } from '../common/helpers/fileHeaderStripper.js'
+import { stripDiagramBlocksForToolOutput } from '../common/helpers/diagramBlockStripper.js'
 
 
 // tool use for AI
@@ -70,6 +72,83 @@ const validateURI = (uriStr: unknown) => {
 const validateOptionalURI = (uriStr: unknown) => {
 	if (isFalsy(uriStr)) return null
 	return validateURI(uriStr)
+}
+
+const parseURIList = (urisUnknown: unknown, maxCount = MAX_READ_FILES_BATCH): string[] => {
+	if (urisUnknown === null || urisUnknown === undefined) {
+		throw new Error('Invalid LLM output: uris was null.')
+	}
+	let paths: string[]
+	if (Array.isArray(urisUnknown)) {
+		paths = urisUnknown.map((u, i) => validateStr(`uris[${i}]`, u))
+	} else if (typeof urisUnknown === 'string') {
+		const trimmed = urisUnknown.trim()
+		if (!trimmed) {
+			throw new Error('Invalid LLM output: uris was empty.')
+		}
+		if (trimmed.startsWith('[')) {
+			let parsed: unknown
+			try {
+				parsed = JSON.parse(trimmed)
+			} catch (e) {
+				throw new Error(`Invalid LLM output: uris JSON parse failed: ${e}`)
+			}
+			if (!Array.isArray(parsed) || parsed.length === 0) {
+				throw new Error('Invalid LLM output: uris must be a non-empty JSON array.')
+			}
+			paths = parsed.map((u, i) => validateStr(`uris[${i}]`, u))
+		} else if (trimmed.includes('\n')) {
+			paths = trimmed.split('\n').map(s => s.trim()).filter(Boolean)
+		} else {
+			paths = trimmed.split(',').map(s => s.trim()).filter(Boolean)
+		}
+	} else {
+		throw new Error(`Invalid LLM output format: uris must be a string or array, got ${typeof urisUnknown}.`)
+	}
+	if (paths.length === 0) {
+		throw new Error('Invalid LLM output: uris must contain at least one path.')
+	}
+	if (paths.length > maxCount) {
+		throw new Error(`Invalid LLM output: uris has ${paths.length} paths; maximum is ${maxCount}.`)
+	}
+	return paths
+}
+
+const validateURIList = (urisUnknown: unknown, maxCount = MAX_READ_FILES_BATCH): URI[] => {
+	return parseURIList(urisUnknown, maxCount).map(validateURI)
+}
+
+async function readFileContentsForTool(
+	mcodeModelService: IVoidModelService,
+	uri: URI,
+	startLine: number | null,
+	endLine: number | null,
+): Promise<{ contents: string, totalNumLines: number }> {
+	await mcodeModelService.initializeModel(uri)
+	const { model } = await mcodeModelService.getModelSafe(uri)
+	if (model === null) {
+		throw new Error(`No contents; File does not exist: ${uri.fsPath}`)
+	}
+
+	const startLineNumber = startLine === null ? 1 : startLine
+	const fromStartOfFile = startLine === null || startLine <= 1
+
+	let contents: string
+	if (startLine === null && endLine === null) {
+		contents = model.getValue(EndOfLinePreference.LF)
+	} else {
+		const endLineNumber = endLine === null ? model.getLineCount() : endLine
+		contents = model.getValueInRange({ startLineNumber, startColumn: 1, endLineNumber, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
+	}
+
+	contents = stripFileHeaderForToolOutput(contents, fromStartOfFile)
+	contents = stripDiagramBlocksForToolOutput(contents)
+
+	return { contents, totalNumLines: model.getLineCount() }
+}
+
+function formatReadFileBlock(uri: URI, contents: string): string {
+	return `${uri.fsPath}\n\`\`\`\n${contents}\n\`\`\``
 }
 
 const validateOptionalStr = (argName: string, str: unknown) => {
@@ -169,6 +248,12 @@ export class ToolsService implements IToolsService {
 				if (endLine !== null && endLine < 1) endLine = null
 
 				return { uri, startLine, endLine, pageNumber }
+			},
+			read_files: (params: RawToolParamsObj) => {
+				const { uris: urisUnknown, page_number: pageNumberUnknown } = params
+				const uris = validateURIList(urisUnknown)
+				const pageNumber = validatePageNum(pageNumberUnknown)
+				return { uris, pageNumber }
 			},
 			ls_dir: (params: RawToolParamsObj) => {
 				const { uri: uriStr, page_number: pageNumberUnknown } = params
@@ -295,28 +380,57 @@ export class ToolsService implements IToolsService {
 
 		this.callTool = {
 			read_file: async ({ uri, startLine, endLine, pageNumber }) => {
-				await mcodeModelService.initializeModel(uri)
-				const { model } = await mcodeModelService.getModelSafe(uri)
-				if (model === null) { throw new Error(`No contents; File does not exist.`) }
-
-				let contents: string
-				if (startLine === null && endLine === null) {
-					contents = model.getValue(EndOfLinePreference.LF)
-				}
-				else {
-					const startLineNumber = startLine === null ? 1 : startLine
-					const endLineNumber = endLine === null ? model.getLineCount() : endLine
-					contents = model.getValueInRange({ startLineNumber, startColumn: 1, endLineNumber, endColumn: Number.MAX_SAFE_INTEGER }, EndOfLinePreference.LF)
-				}
-
-				const totalNumLines = model.getLineCount()
+				const { contents, totalNumLines } = await readFileContentsForTool(mcodeModelService, uri, startLine, endLine)
 
 				const fromIdx = MAX_FILE_CHARS_PAGE * (pageNumber - 1)
 				const toIdx = MAX_FILE_CHARS_PAGE * pageNumber - 1
-				const fileContents = contents.slice(fromIdx, toIdx + 1) // paginate
+				const fileContents = contents.slice(fromIdx, toIdx + 1)
 				const hasNextPage = (contents.length - 1) - toIdx >= 1
 				const totalFileLen = contents.length
 				return { result: { fileContents, totalFileLen, hasNextPage, totalNumLines } }
+			},
+
+			read_files: async ({ uris, pageNumber }) => {
+				const fileResults = await Promise.all(uris.map(async (uri) => {
+					try {
+						const { contents, totalNumLines } = await readFileContentsForTool(mcodeModelService, uri, null, null)
+						return {
+							uri,
+							block: formatReadFileBlock(uri, contents),
+							totalNumLines,
+							totalFileLen: contents.length,
+						}
+					} catch (e) {
+						const message = e instanceof Error ? e.message : String(e)
+						return {
+							uri,
+							block: `${uri.fsPath}\n\`\`\`\nError: ${message}\n\`\`\``,
+							totalNumLines: 0,
+							totalFileLen: 0,
+							error: message,
+						}
+					}
+				}))
+
+				const combined = fileResults.map(f => f.block).join('\n\n')
+				const pageSize = MAX_READ_FILES_COMBINED_PAGE
+				const fromIdx = pageSize * (pageNumber - 1)
+				const toIdx = pageSize * pageNumber - 1
+				const combinedContents = combined.slice(fromIdx, toIdx + 1)
+				const hasNextPage = (combined.length - 1) - toIdx >= 1
+				return {
+					result: {
+						combinedContents,
+						totalCombinedLen: combined.length,
+						hasNextPage,
+						files: fileResults.map(f => ({
+							uri: f.uri,
+							totalNumLines: f.totalNumLines,
+							totalFileLen: f.totalFileLen,
+							...(f.error ? { error: f.error } : {}),
+						})),
+					},
+				}
 			},
 
 			ls_dir: async ({ uri, pageNumber }) => {
@@ -484,7 +598,13 @@ export class ToolsService implements IToolsService {
 		// given to the LLM after the call for successful tool calls
 		this.stringOfResult = {
 			read_file: (params, result) => {
-				return `${params.uri.fsPath}\n\`\`\`\n${result.fileContents}\n\`\`\`${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info: file has ${result.totalNumLines} lines (${result.totalFileLen} chars). Pages are ${MAX_FILE_CHARS_PAGE} chars — use pageNumber for more.` : ''}`
+				const nextPage = params.pageNumber + 1
+				return `${params.uri.fsPath}\n\`\`\`\n${result.fileContents}\n\`\`\`${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info: file has ${result.totalNumLines} lines (${result.totalFileLen} chars). Pages are ${MAX_FILE_CHARS_PAGE} chars. ACTION REQUIRED: call read_file again with the SAME uri and page_number=${nextPage}.` : ''}`
+			},
+			read_files: (params, result) => {
+				const pageSize = MAX_READ_FILES_COMBINED_PAGE
+				const nextPage = params.pageNumber + 1
+				return `${result.combinedContents}${nextPageStr(result.hasNextPage)}${result.hasNextPage ? `\nMore info: combined ${result.totalCombinedLen} chars across ${params.uris.length} files. Pages are ${pageSize} chars. ACTION REQUIRED: call read_files again with the SAME uris and page_number=${nextPage}.` : ''}`
 			},
 			ls_dir: (params, result) => {
 				const dirTreeStr = stringifyDirectoryTree1Deep(params, result)

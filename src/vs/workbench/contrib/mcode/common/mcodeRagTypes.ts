@@ -178,6 +178,8 @@ export interface IVoidRagService {
 	getIndexStatus(): Promise<RagIndexStatus>;
 	testMilvusConnection(config: RagMilvusConfig): Promise<RagMilvusConnectionResult>;
 	queryContext(queryText: string, options?: RagQueryOptions): Promise<string>;
+	/** Wait until the vector index is loaded or index init finishes (whichever comes first). */
+	waitForIndexReady(timeoutMs?: number): Promise<boolean>;
 	getRelatedDependencies(filePath: string, maxResults?: number): Promise<RagRelatedDependency[]>;
 	applyIncrementalChanges(changes: RagFileChange[]): Promise<void>;
 }

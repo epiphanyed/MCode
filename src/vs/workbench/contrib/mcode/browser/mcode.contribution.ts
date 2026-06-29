@@ -64,6 +64,7 @@ import './fileService.js'
 // register source control management
 import './mcodeSCMService.js'
 import './mcodeRagService.js'
+import './mcodeRagInitContrib.js'
 import './mcodeRagSyncContrib.js'
 import './mcodeDiagramService.js'
 
@@ -71,6 +72,10 @@ import './mcodeDiagramService.js'
 
 // llmMessage
 import '../common/sendLLMMessageService.js'
+import '../common/llamaServerContextService.js'
+
+// llama-server /props context sync
+import './llamaServerContextContrib.js'
 
 // voidSettings
 import '../common/mcodeSettingsService.js'
@@ -86,3 +91,7 @@ import '../common/mcodeUpdateService.js'
 
 // model service
 import '../common/mcodeModelService.js'
+
+// repository map service
+import '../common/repositoryMapService.js'
+

@@ -10,6 +10,8 @@ import { useAccessor, useChatThreadsState, useChatThreadsStreamState, useSetting
 import { ScrollType } from '../../../../../../../editor/common/editorCommon.js';
 
 import { ChatMarkdownRender, ChatMessageLocation, getApplyBoxId } from '../markdown/ChatMarkdownRender.js';
+import { TaskPlanPanel, TaskPlanStickyBar } from '../markdown/TaskPlanPanel.js';
+import { extractTaskPlanFromMarkdown, findLatestTaskPlanInMessages } from '../../../../common/helpers/taskPlanParser.js';
 import { URI } from '../../../../../../../base/common/uri.js';
 import { IDisposable } from '../../../../../../../base/common/lifecycle.js';
 import { ErrorDisplay } from './ErrorDisplay.js';
@@ -30,8 +32,8 @@ import { approvalTypeOfBuiltinToolName, BuiltinToolCallParams, BuiltinToolName, 
 import { CopyButton, EditToolAcceptRejectButtonsHTML, IconShell1, JumpToFileButton, JumpToTerminalButton, StatusIndicator, StatusIndicatorForApplyButton, useApplyStreamState, useEditToolStreamState } from '../markdown/ApplyBlockHoverButtons.js';
 import { IsRunningType } from '../../../chatThreadService.js';
 import { acceptAllBg, acceptBorder, buttonFontSize, buttonTextColor, rejectAllBg, rejectBg, rejectBorder } from '../../../../common/helpers/colors.js';
-import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE, MAX_TERMINAL_INACTIVE_TIME } from '../../../../common/prompt/prompts.js';
-import { RawToolCallObj } from '../../../../common/sendLLMMessageTypes.js';
+import { builtinToolNames, isABuiltinToolName, MAX_FILE_CHARS_PAGE, MAX_READ_FILES_COMBINED_PAGE, MAX_TERMINAL_INACTIVE_TIME } from '../../../../common/prompt/prompts.js';
+import { RawToolCallObj, RawToolParamsObj } from '../../../../common/sendLLMMessageTypes.js';
 import ErrorBoundary from './ErrorBoundary.js';
 import { DependencyRecommendations } from './DependencyRecommendations.js';
 import { ToolApprovalTypeSwitch } from '../mcode-settings-tsx/Settings.js';
@@ -1453,6 +1455,10 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 	const isDoneReasoning = !!chatMessage.displayContent
 	const thread = chatThreadsService.getCurrentThread()
 
+	const { plan, body } = useMemo(
+		() => extractTaskPlanFromMarkdown(chatMessage.displayContent || ''),
+		[chatMessage.displayContent],
+	)
 
 	const chatMessageLocation: ChatMessageLocation = {
 		threadId: thread.id,
@@ -1479,12 +1485,18 @@ const AssistantMessageComponent = ({ chatMessage, isCheckpointGhost, isCommitted
 			</div>
 		}
 
+		{plan && !isCheckpointGhost && (
+			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
+				<TaskPlanPanel plan={plan} threadId={thread.id} messageIdx={messageIdx} />
+			</div>
+		)}
+
 		{/* assistant message */}
-		{chatMessage.displayContent &&
+		{(body || (!plan && chatMessage.displayContent)) &&
 			<div className={`${isCheckpointGhost ? 'opacity-50' : ''}`}>
 				<ProseWrapper>
 					<ChatMarkdownRender
-						string={chatMessage.displayContent || ''}
+						string={body || chatMessage.displayContent || ''}
 						chatMessageLocation={chatMessageLocation}
 						isApplyEnabled={true}
 						isLinkDetectionEnabled={true}
@@ -1526,6 +1538,7 @@ const loadingTitleWrapper = (item: React.ReactNode): React.ReactNode => {
 
 const titleOfBuiltinToolName = {
 	'read_file': { done: 'Read file', proposed: 'Read file', running: loadingTitleWrapper('Reading file') },
+	'read_files': { done: 'Read files', proposed: 'Read files', running: loadingTitleWrapper('Reading files') },
 	'ls_dir': { done: 'Inspected folder', proposed: 'Inspect folder', running: loadingTitleWrapper('Inspecting folder') },
 	'get_dir_tree': { done: 'Inspected folder tree', proposed: 'Inspect folder tree', running: loadingTitleWrapper('Inspecting folder tree') },
 	'search_pathnames_only': { done: 'Searched by file name', proposed: 'Search by file name', running: loadingTitleWrapper('Searching by file name') },
@@ -1577,6 +1590,46 @@ const getTitle = (toolMessage: Pick<ChatMessage & { role: 'tool' }, 'name' | 'ty
 }
 
 
+const reviveToolUri = (value: unknown): URI | undefined => {
+	if (!value) return undefined
+	if (value instanceof URI) return value
+	if (typeof value === 'string') return URI.file(value)
+	if (typeof value === 'object') {
+		const obj = value as { $mid?: number; fsPath?: string; path?: string; external?: string; scheme?: string }
+		if (obj.$mid === 1) return URI.from(obj as Parameters<typeof URI.from>[0])
+		if (obj.fsPath) return URI.file(obj.fsPath)
+		if (obj.path && obj.scheme) return URI.from(obj as Parameters<typeof URI.from>[0])
+	}
+	return undefined
+}
+
+const parseReadFilesUriPaths = (raw: unknown): string[] => {
+	if (Array.isArray(raw)) {
+		return raw.map(v => String(v).trim()).filter(Boolean)
+	}
+	if (typeof raw !== 'string') return []
+	const trimmed = raw.trim()
+	if (!trimmed) return []
+	if (trimmed.startsWith('[')) {
+		try {
+			const parsed = JSON.parse(trimmed)
+			if (Array.isArray(parsed)) return parsed.map(v => String(v).trim()).filter(Boolean)
+		} catch { /* fall through */ }
+	}
+	if (trimmed.includes('\n')) return trimmed.split('\n').map(s => s.trim()).filter(Boolean)
+	return trimmed.split(',').map(s => s.trim()).filter(Boolean)
+}
+
+const resolveReadFilesUris = (
+	params: BuiltinToolCallParams['read_files'] | undefined,
+	rawParams: RawToolParamsObj | undefined,
+): URI[] => {
+	const fromParams = params?.uris?.map(reviveToolUri).filter((u): u is URI => !!u) ?? []
+	if (fromParams.length > 0) return fromParams
+	return parseReadFilesUriPaths(rawParams?.uris).map(p => URI.file(p))
+}
+
+
 const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallParams[BuiltinToolName] | undefined, accessor: ReturnType<typeof useAccessor>): {
 	desc1: React.ReactNode,
 	desc1Info?: string,
@@ -1593,6 +1646,21 @@ const toolNameToDesc = (toolName: BuiltinToolName, _toolParams: BuiltinToolCallP
 				desc1: getBasename(toolParams.uri.fsPath),
 				desc1Info: getRelative(toolParams.uri, accessor),
 			};
+		},
+		'read_files': () => {
+			const toolParams = _toolParams as BuiltinToolCallParams['read_files']
+			const n = toolParams.uris.length
+			if (n <= 1) {
+				const uri = toolParams.uris[0]
+				return {
+					desc1: uri ? getBasename(uri.fsPath) : '',
+					desc1Info: uri ? getRelative(uri, accessor) : undefined,
+				}
+			}
+			return {
+				desc1: `${n} files`,
+				desc1Info: toolParams.uris.map(u => getRelative(u, accessor) || u.fsPath).join('\n'),
+			}
 		},
 		'ls_dir': () => {
 			const toolParams = _toolParams as BuiltinToolCallParams['ls_dir']
@@ -2125,6 +2193,82 @@ const builtinToolNameToComponent: { [T in BuiltinToolName]: { resultWrapper: Res
 			else if (toolMessage.type === 'tool_error') {
 				const { result } = toolMessage
 				// JumpToFileButton removed in favor of FileLinkText
+				componentParams.bottomChildren = <BottomChildren title='Error'>
+					<CodeChildren>
+						{result}
+					</CodeChildren>
+				</BottomChildren>
+			}
+
+			return <ToolHeaderWrapper {...componentParams} />
+		},
+	},
+	'read_files': {
+		resultWrapper: ({ toolMessage }) => {
+			const accessor = useAccessor()
+
+			const title = getTitle(toolMessage)
+			const icon = null
+
+			if (toolMessage.type === 'tool_request') return null
+			if (toolMessage.type === 'running_now') return null
+
+			const isError = false
+			const isRejected = toolMessage.type === 'rejected'
+			const { params, rawParams } = toolMessage
+			const uris = resolveReadFilesUris(
+				toolMessage.name === 'read_files' ? params as BuiltinToolCallParams['read_files'] : undefined,
+				rawParams,
+			)
+
+			const desc1 = uris.length <= 1
+				? (uris[0] ? getBasename(uris[0].fsPath) : '')
+				: `${uris.length} files`
+			const desc1Info = uris.length <= 1
+				? (uris[0] ? getRelative(uris[0], accessor) : undefined)
+				: uris.map(u => getRelative(u, accessor) || u.fsPath).join('\n')
+
+			const componentParams: ToolHeaderParams = { title, desc1, desc1Info, isError, icon, isRejected, }
+
+			if (uris.length > 0) {
+				componentParams.children = (
+					<ToolChildrenWrapper>
+						{uris.map((uri, i) => {
+							const fileMeta = toolMessage.type === 'success'
+								? toolMessage.result.files.find(f => f.uri.fsPath === uri.fsPath)
+								: undefined
+							const rel = getRelative(uri, accessor) || getBasename(uri.fsPath)
+							const label = fileMeta?.error ? `${rel} (error)` : rel
+							return (
+								<ListableToolItem
+									key={`${uri.fsPath}-${i}`}
+									name={label}
+									className='w-full overflow-auto'
+									onClick={() => { voidOpenFileFn(uri, accessor) }}
+								/>
+							)
+						})}
+						{toolMessage.type === 'success' && toolMessage.result.hasNextPage && (
+							<ListableToolItem
+								name='Content truncated — use pageNumber for more.'
+								isSmall={true}
+								className='w-full overflow-auto'
+							/>
+						)}
+					</ToolChildrenWrapper>
+				)
+			}
+
+			if (toolMessage.type === 'success') {
+				const { result } = toolMessage
+				if (result.hasNextPage && params.pageNumber === 1) {
+					componentParams.desc2 = `(truncated after ${Math.round(MAX_READ_FILES_COMBINED_PAGE) / 1000}k combined)`
+				} else if (params.pageNumber > 1) {
+					componentParams.desc2 = `(part ${params.pageNumber})`
+				}
+			}
+			else if (toolMessage.type === 'tool_error') {
+				const { result } = toolMessage
 				componentParams.bottomChildren = <BottomChildren title='Error'>
 					<CodeChildren>
 						{result}
@@ -2815,8 +2959,9 @@ const CommandBarInChat = () => {
 
 	const threadStatus = (
 		chatThreadsStreamState?.isRunning === 'awaiting_user' ? { title: 'Needs Approval', color: 'yellow', } as const
-			: chatThreadsStreamState?.isRunning ? { title: 'Running', color: 'orange', } as const
-				: { title: 'Done', color: 'dark', } as const
+			: chatThreadsStreamState?.isRunning === 'awaiting_batch_review' ? { title: 'Review Changes', color: 'yellow', } as const
+				: chatThreadsStreamState?.isRunning ? { title: 'Running', color: 'orange', } as const
+					: { title: 'Done', color: 'dark', } as const
 	)
 
 
@@ -2884,7 +3029,7 @@ const CommandBarInChat = () => {
 
 
 	// !select-text cursor-auto
-	const fileDetailsContent = <div className="px-2 gap-1 w-full overflow-y-auto">
+	const fileDetailsContent = <div className="px-2 py-1 gap-1 w-full overflow-y-auto">
 		{sortedCommandBarURIs.map((uri, i) => {
 			const basename = getBasename(uri.fsPath)
 
@@ -2981,34 +3126,16 @@ const CommandBarInChat = () => {
 	)
 
 	return (
-		<>
-			{/* file details */}
-			<div className='px-2'>
-				<div
-					className={`
-						select-none
-						flex w-full rounded-t-lg bg-void-bg-3
-						text-void-fg-3 text-xs text-nowrap
-
-						overflow-hidden transition-all duration-200 ease-in-out
-						${isFileDetailsOpened ? 'max-h-24' : 'max-h-0'}
-					`}
-				>
-					{fileDetailsContent}
-				</div>
-			</div>
-			{/* main content */}
-			<div
-				className={`
-					select-none
-					flex w-full rounded-t-lg bg-void-bg-3
-					text-void-fg-3 text-xs text-nowrap
-					border-t border-l border-r border-zinc-300/10
-
-					px-2 py-1
-					justify-between
-				`}
-			>
+		<div
+			className={`
+				select-none
+				flex flex-col w-full rounded-t-lg bg-void-bg-3
+				text-void-fg-3 text-xs text-nowrap
+				border-t border-l border-r border-zinc-300/10
+			`}
+		>
+			{/* summary header — always on top */}
+			<div className="flex px-2 py-1 justify-between items-center">
 				<div className="flex gap-2 items-center">
 					{fileDetailsButton}
 				</div>
@@ -3017,7 +3144,16 @@ const CommandBarInChat = () => {
 					{threadStatusHTML}
 				</div>
 			</div>
-		</>
+			{/* file list — expands downward below the header (Cursor-style) */}
+			<div
+				className={`
+					overflow-hidden transition-all duration-200 ease-in-out
+					${isFileDetailsOpened && numFilesChanged > 0 ? 'max-h-40 border-t border-zinc-300/10' : 'max-h-0'}
+				`}
+			>
+				{fileDetailsContent}
+			</div>
+		</div>
 	)
 }
 
@@ -3060,6 +3196,42 @@ const EditToolSoFar = ({ toolCallSoFar, }: { toolCallSoFar: RawToolCallObj }) =>
 }
 
 
+const AgentBatchReviewBar = ({ threadId }: { threadId: string }) => {
+	const accessor = useAccessor()
+	const chatThreadsService = accessor.get('IChatThreadService')
+	const commandBarState = useCommandBarState()
+
+	const pendingCount = useMemo(() => {
+		return commandBarState.sortedURIs.filter(uri => {
+			const s = commandBarState.stateOfURI[uri.fsPath]
+			return s && !s.isStreaming && (s.sortedDiffIds?.length ?? 0) > 0
+		}).length
+	}, [commandBarState])
+
+	if (pendingCount === 0) return null
+
+	return (
+		<div className='mx-2 mb-2 px-3 py-2 rounded border border-void-border-3 bg-void-bg-2 flex items-center justify-between gap-2 text-sm'>
+			<span className='text-void-fg-2'>{pendingCount} 个文件有待确认的修改</span>
+			<div className='flex items-center gap-1 shrink-0'>
+				<button
+					className='px-2 py-1 rounded text-xs bg-[var(--vscode-button-secondaryBackground)] text-[var(--vscode-button-secondaryForeground)] hover:bg-[var(--vscode-button-secondaryHoverBackground)]'
+					onClick={() => chatThreadsService.rejectAllDeferredEdits(threadId)}
+				>
+					全部拒绝
+				</button>
+				<button
+					className='px-2 py-1 rounded text-xs bg-[var(--vscode-button-background)] text-[var(--vscode-button-foreground)] hover:bg-[var(--vscode-button-hoverBackground)]'
+					onClick={() => chatThreadsService.acceptAllDeferredEdits(threadId)}
+				>
+					全部接受
+				</button>
+			</div>
+		</div>
+	)
+}
+
+
 export const SidebarChat = () => {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null)
 	const textAreaFnsRef = useRef<TextAreaFns | null>(null)
@@ -3099,10 +3271,20 @@ export const SidebarChat = () => {
 
 	const sidebarRef = useRef<HTMLDivElement>(null)
 	const scrollContainerRef = useRef<HTMLDivElement | null>(null)
+	const isBlockingRun = isRunning && isRunning !== 'awaiting_batch_review'
+
+	const activeTaskPlan = useMemo(() => {
+		const msgs: { role: string; displayContent?: string }[] = [...previousMessages]
+		if (displayContentSoFar) {
+			msgs.push({ role: 'assistant', displayContent: displayContentSoFar })
+		}
+		return findLatestTaskPlanInMessages(msgs)
+	}, [previousMessages, displayContentSoFar])
+
 	const onSubmit = useCallback(async (_forceSubmit?: string) => {
 
 		if (isDisabled && !_forceSubmit) return
-		if (isRunning) return
+		if (isBlockingRun) return
 
 		const threadId = chatThreadsService.state.currentThreadId
 
@@ -3119,7 +3301,7 @@ export const SidebarChat = () => {
 		textAreaFnsRef.current?.setValue('')
 		textAreaRef.current?.focus() // focus input after submit
 
-	}, [chatThreadsService, isDisabled, isRunning, textAreaRef, textAreaFnsRef, setSelections, settingsState])
+	}, [chatThreadsService, isDisabled, isBlockingRun, textAreaRef, textAreaFnsRef, setSelections, settingsState])
 
 	const onAbort = async () => {
 		const threadId = currentThread.id
@@ -3249,7 +3431,7 @@ export const SidebarChat = () => {
 		featureName='Chat'
 		onSubmit={() => onSubmit()}
 		onAbort={onAbort}
-		isStreaming={!!isRunning}
+		isStreaming={!!isRunning && isRunning !== 'awaiting_batch_review'}
 		isDisabled={isDisabled}
 		showSelections={true}
 		// showProspectiveSelections={previousMessagesHTML.length === 0}
@@ -3297,6 +3479,16 @@ export const SidebarChat = () => {
 		<div className='px-4'>
 			<CommandBarInChat />
 		</div>
+		{activeTaskPlan && (isRunning === 'LLM' || isRunning === 'tool' || isRunning === 'idle') ? (
+			<TaskPlanStickyBar
+				threadId={threadId}
+				messageIdx={activeTaskPlan.messageIdx}
+				plan={activeTaskPlan.plan}
+			/>
+		) : null}
+		{isRunning === 'awaiting_batch_review' ? (
+			<AgentBatchReviewBar threadId={threadId} />
+		) : null}
 		<div className='px-2 pb-2'>
 			{inputChatArea}
 		</div>

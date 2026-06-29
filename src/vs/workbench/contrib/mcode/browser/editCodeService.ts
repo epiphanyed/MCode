@@ -12,6 +12,7 @@ import { ICodeEditor, IOverlayWidget, IViewZone } from '../../../../editor/brows
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
 // import { throttle } from '../../../../base/common/decorators.js';
 import { findDiffs } from './helpers/findDiffs.js';
+import { findTextInCode, sanitizeSearchReplaceOrig, suggestFileContextForFailedMatch } from './helpers/findTextInCode.js';
 import { EndOfLinePreference, IModelDecorationOptions, ITextModel } from '../../../../editor/common/model.js';
 import { IRange } from '../../../../editor/common/core/range.js';
 import { IModelService } from '../../../../editor/common/services/model.js';
@@ -48,9 +49,6 @@ import { DiffArea, Diff, CtrlKZone, VoidFileSnapshot, DiffAreaSnapshotEntry, dif
 import { IConvertToLLMMessageService } from './convertToLLMMessageService.js';
 // import { isMacintosh } from '../../../../base/common/platform.js';
 // import { VOID_OPEN_SETTINGS_ACTION_ID } from './mcodeSettingsPane.js';
-
-const numLinesOfStr = (str: string) => str.split('\n').length
-
 
 export const getLengthOfTextPx = ({ tabWidth, spaceWidth, content }: { tabWidth: number, spaceWidth: number, content: string }) => {
 	let lengthOfTextPx = 0;
@@ -98,55 +96,6 @@ const getLeadingWhitespacePx = (editor: ICodeEditor, startLine: number): number 
 
 	return leftWhitespacePx;
 };
-
-
-// Helper function to remove whitespace except newlines
-const removeWhitespaceExceptNewlines = (str: string): string => {
-	return str.replace(/[^\S\n]+/g, '');
-}
-
-
-
-// finds block.orig in fileContents and return its range in file
-// startingAtLine is 1-indexed and inclusive
-// returns 1-indexed lines
-const findTextInCode = (text: string, fileContents: string, canFallbackToRemoveWhitespace: boolean, opts: { startingAtLine?: number, returnType: 'lines' }) => {
-
-	const returnAns = (fileContents: string, idx: number) => {
-		const startLine = numLinesOfStr(fileContents.substring(0, idx + 1))
-		const numLines = numLinesOfStr(text)
-		const endLine = startLine + numLines - 1
-
-		return [startLine, endLine] as const
-	}
-
-	const startingAtLineIdx = (fileContents: string) => opts?.startingAtLine !== undefined ?
-		fileContents.split('\n').slice(0, opts.startingAtLine).join('\n').length // num characters in all lines before startingAtLine
-		: 0
-
-	// idx = starting index in fileContents
-	let idx = fileContents.indexOf(text, startingAtLineIdx(fileContents))
-
-	// if idx was found
-	if (idx !== -1) {
-		return returnAns(fileContents, idx)
-	}
-
-	if (!canFallbackToRemoveWhitespace)
-		return 'Not found' as const
-
-	// try to find it ignoring all whitespace this time
-	text = removeWhitespaceExceptNewlines(text)
-	fileContents = removeWhitespaceExceptNewlines(fileContents)
-	idx = fileContents.indexOf(text, startingAtLineIdx(fileContents));
-
-	if (idx === -1) return 'Not found' as const
-	const lastIdx = fileContents.lastIndexOf(text)
-	if (lastIdx !== idx) return 'Not unique' as const
-
-	return returnAns(fileContents, idx)
-}
-
 
 
 // line/col is the location, originalCodeStartLine is the start line of the original code being displayed
@@ -1591,14 +1540,21 @@ class EditCodeService extends Disposable implements IEditCodeService {
 	private _errContentOfInvalidStr = (
 		str: 'Not found' | 'Not unique' | 'Has overlap',
 		blockOrig: string,
+		fileContents?: string,
 	): string => {
-		const problematicCode = `${tripleTick[0]}\n${JSON.stringify(blockOrig)}\n${tripleTick[1]}`
+		const problematicCode = `${tripleTick[0]}\n${blockOrig}\n${tripleTick[1]}`
 
 		// use a switch for better readability / exhaustiveness check
 		let descStr: string
 		switch (str) {
 			case 'Not found':
-				descStr = `The edit was not applied. The text in ORIGINAL must EXACTLY match lines of code in the file, but there was no match for:\n${problematicCode}. Ensure you have the latest version of the file, and ensure the ORIGINAL code matches a code excerpt exactly.`
+				descStr = `The edit was not applied. The text in ORIGINAL must EXACTLY match lines of code in the file, but there was no match for:\n${problematicCode}. Ensure you have the latest version of the file (use read_file first), and ensure the ORIGINAL code matches a code excerpt exactly — including markdown heading/list markers (# vs - vs ##).`
+				if (fileContents) {
+					const nearby = suggestFileContextForFailedMatch(blockOrig, fileContents);
+					if (nearby) {
+						descStr += `\n\nClosest matching region in the file (copy this verbatim into ORIGINAL next time):\n${tripleTick[0]}\n${nearby}\n${tripleTick[1]}`;
+					}
+				}
 				break
 			case 'Not unique':
 				descStr = `The edit was not applied. The text in ORIGINAL must be unique in the file being edited, but the following ORIGINAL code appears multiple times in the file:\n${problematicCode}. Ensure you have the latest version of the file, and ensure the ORIGINAL code is unique.`
@@ -1628,9 +1584,10 @@ class EditCodeService extends Disposable implements IEditCodeService {
 
 		const replacements: { origStart: number; origEnd: number; block: ExtractedSearchReplaceBlock }[] = []
 		for (const b of blocks) {
-			const res = findTextInCode(b.orig, modelStr, true, { returnType: 'lines' })
+			const orig = sanitizeSearchReplaceOrig(b.orig)
+			const res = findTextInCode(orig, modelStr)
 			if (typeof res === 'string')
-				throw new Error(this._errContentOfInvalidStr(res, b.orig))
+				throw new Error(this._errContentOfInvalidStr(res, orig, modelStr))
 			let [startLine, endLine] = res
 			startLine -= 1 // 0-index
 			endLine -= 1
@@ -1812,7 +1769,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 							// update stream state to the first line of original if some portion of original has been written
 							if (shouldUpdateOrigStreamStyle && block.orig.trim().length >= 20) {
 								const startingAtLine = diffZone._streamState.line ?? 1 // dont go backwards if already have a stream line
-								const originalRange = findTextInCode(block.orig, originalFileCode, false, { startingAtLine, returnType: 'lines' })
+								const originalRange = findTextInCode(sanitizeSearchReplaceOrig(block.orig), originalFileCode, { startingAtLine, strictOnly: true })
 								if (typeof originalRange !== 'string') {
 									const [startLine, _] = convertOriginalRangeToFinalRange(originalRange)
 									diffZone._streamState.line = startLine
@@ -1838,7 +1795,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 						// if this is the first time we're seeing this block, add it as a diffarea so we can start streaming in it
 						if (!(blockNum in addedTrackingZoneOfBlockNum)) {
 
-							const originalBounds = findTextInCode(block.orig, originalFileCode, true, { returnType: 'lines' })
+							const originalBounds = findTextInCode(sanitizeSearchReplaceOrig(block.orig), originalFileCode)
 							// if error
 							// Check for overlap with existing modified ranges
 							const hasOverlap = addedTrackingZoneOfBlockNum.some(trackingZone => {
@@ -1856,7 +1813,7 @@ class EditCodeService extends Disposable implements IEditCodeService {
 								console.log('error:', errorMessage)
 								console.log('block.orig:', block.orig)
 								console.log('---------')
-								const content = this._errContentOfInvalidStr(errorMessage, block.orig)
+								const content = this._errContentOfInvalidStr(errorMessage, sanitizeSearchReplaceOrig(block.orig), originalFileCode)
 								const retryMsg = 'All of your previous outputs have been ignored. Please re-output ALL SEARCH/REPLACE blocks starting from the first one, and avoid the error this time.'
 								messages.push(
 									{ role: 'assistant', content: fullText }, // latest output

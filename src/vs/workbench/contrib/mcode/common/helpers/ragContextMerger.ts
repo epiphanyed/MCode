@@ -5,6 +5,7 @@
 
 import { RagContextBundle, RagContextMergeOptions, RagContextMergeResult } from '../mcodeRagTypes.js';
 import { StagingSelectionItem } from '../chatThreadServiceTypes.js';
+import { ragLogBody, ragLogStage } from './ragDebugLog.js';
 
 export const DEFAULT_MAX_TOTAL_CHARS = 12_000;
 export const DEFAULT_LSP_BUDGET_RATIO = 0.3;
@@ -192,6 +193,17 @@ export function mergeRagContexts(
 	}
 
 	const { gitChunks, codeChunks } = partitionVectorChunks(vector);
+	ragLogStage(
+		'merge',
+		`input vectorChars=${vector.length} lspSnippets=${bundle.lspSnippets.length} `
+		+ `gitChunks=${gitChunks.length} codeChunks=${codeChunks.length} maxTotal=${maxTotalChars}`,
+	);
+	if (vector) {
+		ragLogBody('merge', 'input vectorContext (full)', vector);
+	}
+	for (let i = 0; i < bundle.lspSnippets.length; i++) {
+		ragLogBody('merge', `input lspSnippet[${i}] (full)`, bundle.lspSnippets[i]);
+	}
 	const gitText = fillChunksWithinBudget(gitChunks, gitMaxChars, {
 		lspKeys: new Set(),
 		excludeFilePaths: [],
@@ -220,8 +232,25 @@ export function mergeRagContexts(
 		sections.push(`[RAG Context]:\n${vectorText}`);
 	}
 
+	const merged = sections.join('\n\n');
+	ragLogStage(
+		'merge',
+		`budgets lsp=${lspBudget} vector=${vectorBudget} git=${gitMaxChars} `
+		+ `out lspChars=${lspText.length} gitChars=${gitText.length} vectorChars=${vectorText.length} total=${merged.length}`,
+	);
+	if (lspText) {
+		ragLogBody('merge', 'LSP section', lspText);
+	}
+	if (gitText) {
+		ragLogBody('merge', 'Git section', gitText);
+	}
+	if (vectorText) {
+		ragLogBody('merge', 'RAG section', vectorText);
+	}
+	ragLogBody('merge', 'mergedContext', merged);
+
 	return {
-		merged: sections.join('\n\n'),
+		merged,
 		hasLsp: !!lspText,
 		hasVector: !!vectorText || !!gitText,
 	};

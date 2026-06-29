@@ -17,6 +17,7 @@ import {
 	float32ToBuffer,
 	normalizeToFloat32,
 } from './localVectorSearch.js';
+import { ragLogBody, ragLogStage } from '../../common/helpers/ragDebugLog.js';
 
 export const LOCAL_VECTOR_DB_FILENAME = 'rag_vectors.db';
 export const LOCAL_VECTOR_STORAGE_ENGINE = 'sqlite-hnsw-v1';
@@ -25,6 +26,9 @@ const SCHEMA_VERSION = 2;
 const SEARCH_BATCH_SIZE = 512;
 const INSERT_CHUNK_SIZE = 128;
 const HNSW_REBUILD_BATCH_SIZE = 256;
+/** When post-filtering by doc_type, scale searchK by inverse doc-type ratio. */
+const HNSW_DOC_FILTER_OVERSAMPLE = 32;
+const HNSW_DOC_FILTER_RATIO_MARGIN = 1.5;
 
 interface RagChunkRow {
 	chunk_id: string;
@@ -209,6 +213,25 @@ export class LocalSqliteVectorStore {
 		return row?.count ?? 0;
 	}
 
+	async getDocTypeCounts(): Promise<Record<string, number>> {
+		const rows = await all<{ doc_type: string; count: number }>(
+			this.db,
+			'SELECT doc_type, COUNT(*) AS count FROM rag_chunks GROUP BY doc_type',
+		);
+		const counts: Record<string, number> = {};
+		for (const row of rows) {
+			counts[row.doc_type] = row.count;
+		}
+		return counts;
+	}
+
+	getHnswVectorCount(): number {
+		if (this.hnswDisabled || !this.hnsw) {
+			return 0;
+		}
+		return this.hnsw.size();
+	}
+
 	async insertRecords(records: LocalVectorRecord[]): Promise<void> {
 		if (records.length === 0) {
 			return;
@@ -302,30 +325,98 @@ export class LocalSqliteVectorStore {
 			);
 		}
 
+		const chunkCount = await this.getChunkCount();
 		if (this.hnsw && this.hnsw.size() > 0) {
-			const hits = await this.similaritySearchHnsw(query, options);
+			let hits = await this.similaritySearchHnsw(query, options);
 			const hasDocFilter = Boolean(options.docTypes && options.docTypes.filter(Boolean).length > 0);
-			if (hits.length < options.topK && hasDocFilter) {
-				const chunkCount = await this.getChunkCount();
-				if (chunkCount > hits.length) {
-					console.log(`[RAG] HNSW returned only ${hits.length} hits under docTypes filter (db has ${chunkCount} total chunks), falling back to brute force.`);
-					return this.similaritySearchBruteForce(query, options);
-				}
+			if (hits.length < options.topK && hasDocFilter && chunkCount > hits.length) {
+				const hnswSize = this.hnsw.size();
+				ragLogStage(
+					'search',
+					`HNSW docType filter ${hits.length}/${options.topK}; retrying searchK=${hnswSize}`,
+				);
+				hits = await this.similaritySearchHnsw(query, options, hnswSize);
 			}
+			if (hits.length < options.topK && hasDocFilter && chunkCount > hits.length) {
+				ragLogStage(
+					'search',
+					`HNSW still ${hits.length}/${options.topK} filter=${JSON.stringify(options.docTypes)}; brute force on filtered rows`,
+				);
+				const bruteHits = await this.similaritySearchBruteForce(query, options);
+				this.logSearchResult('brute-force-fallback', bruteHits, options, chunkCount);
+				return bruteHits;
+			}
+			this.logSearchResult('hnsw', hits, options, chunkCount);
 			return hits;
 		}
-		return this.similaritySearchBruteForce(query, options);
+		const bruteHits = await this.similaritySearchBruteForce(query, options);
+		this.logSearchResult('brute-force', bruteHits, options, chunkCount);
+		return bruteHits;
+	}
+
+	private logSearchResult(
+		mode: string,
+		hits: LocalSimilarityHit[],
+		options: LocalSimilaritySearchOptions,
+		chunkCount: number,
+	): void {
+		const topScores = hits.map(h => h.score.toFixed(3));
+		const samplePaths = [...new Set(hits.map(h => h.record.filePath))];
+		ragLogStage(
+			'search',
+			`${mode} topK=${options.topK} docTypes=${JSON.stringify(options.docTypes ?? null)} `
+			+ `dbChunks=${chunkCount} hits=${hits.length} topScores=[${topScores.join(',')}] paths=${JSON.stringify(samplePaths)}`,
+		);
+		const hitText = hits.map((h, i) =>
+			`#${i} score=${h.score.toFixed(3)} type=${h.record.docType} ${h.record.filePath}\n${h.record.textContent}`,
+		).join('\n---\n');
+		ragLogBody('search', `${mode} hits`, hitText);
+	}
+
+	private async computeHnswSearchKForDocFilter(
+		topK: number,
+		docTypes: string[],
+		hnswSize: number,
+		chunkCount: number,
+	): Promise<number> {
+		const placeholders = docTypes.map(() => '?').join(', ');
+		const row = await get<{ count: number }>(
+			this.db,
+			`SELECT COUNT(*) AS count FROM rag_chunks WHERE doc_type IN (${placeholders})`,
+			docTypes,
+		);
+		const filteredCount = Math.max(row?.count ?? 0, 1);
+		const ratio = chunkCount / filteredCount;
+		const ratioBased = Math.ceil(topK * ratio * HNSW_DOC_FILTER_RATIO_MARGIN);
+		const fixedMin = Math.max(topK * HNSW_DOC_FILTER_OVERSAMPLE, topK + 64);
+		return Math.min(Math.max(ratioBased, fixedMin), hnswSize);
 	}
 
 	private async similaritySearchHnsw(
 		query: Float32Array,
 		options: LocalSimilaritySearchOptions,
+		searchKOverride?: number,
 	): Promise<LocalSimilarityHit[]> {
 		const docTypes = options.docTypes?.filter(Boolean);
 		const hasDocFilter = Boolean(docTypes && docTypes.length > 0);
-		const searchK = Math.min(options.topK, this.hnsw!.size());
+		const hnswSize = this.hnsw!.size();
+		let searchK: number;
+		if (searchKOverride !== undefined) {
+			searchK = Math.min(searchKOverride, hnswSize);
+		} else if (hasDocFilter) {
+			const chunkCount = await this.getChunkCount();
+			searchK = await this.computeHnswSearchKForDocFilter(
+				options.topK,
+				docTypes!,
+				hnswSize,
+				chunkCount,
+			);
+		} else {
+			searchK = Math.min(options.topK, hnswSize);
+		}
 		const hits = this.hnsw!.search(query, searchK);
 		if (hits.keys.length === 0) {
+			ragLogStage('search', `hnsw searchK=${searchK} raw=0 (empty index)`);
 			return [];
 		}
 
@@ -344,7 +435,14 @@ export class LocalSqliteVectorStore {
 				record,
 				score: hnswDistanceToSimilarity(hits.distances[i]),
 			});
+			if (results.length >= options.topK) {
+				break;
+			}
 		}
+		ragLogStage(
+			'search',
+			`hnsw searchK=${searchK} raw=${hits.keys.length} afterDocFilter=${results.length} docTypes=${JSON.stringify(docTypes ?? null)}`,
+		);
 		return results;
 	}
 

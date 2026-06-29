@@ -452,6 +452,8 @@ export type GlobalSettings = {
 	isOnboardingComplete: boolean;
 	disableSystemMessage: boolean;
 	autoAcceptLLMChanges: boolean;
+	/** Agent 模式下 edit_file/rewrite_file 不逐次审核，任务结束后再批量 Accept/Reject。 */
+	agentDeferredEditReview: boolean;
 	indexType: 'local' | 'milvus';
 	milvusUrl: string;
 	milvusUsername: string;
@@ -505,6 +507,7 @@ export const defaultGlobalSettings: GlobalSettings = {
 	isOnboardingComplete: false,
 	disableSystemMessage: false,
 	autoAcceptLLMChanges: false,
+	agentDeferredEditReview: true,
 	indexType: 'local',
 	milvusUrl: 'localhost:19530',
 	milvusUsername: '',

@@ -50,6 +50,8 @@ class VoidModelService extends Disposable implements IVoidModelService {
 			if (!this._fileService.hasProvider(uri)) return;
 			// check if file exists, if not exit early (prevents uncaught exceptions for missing files like .mcoderules)
 			if (!(await this._fileService.exists(uri))) return;
+			const stat = await this._fileService.resolve(uri);
+			if (stat.isDirectory) return;
 			const editorModelRef = await this._textModelService.createModelReference(uri);
 			// Keep a strong reference to prevent disposal
 			this._modelRefOfURI[uri.fsPath] = editorModelRef;

@@ -3,7 +3,7 @@
  *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
  *--------------------------------------------------------------------------------------*/
 
-import { EventLLMMessageOnTextParams, EventLLMMessageOnErrorParams, EventLLMMessageOnFinalMessageParams, ServiceSendLLMMessageParams, MainSendLLMMessageParams, MainLLMMessageAbortParams, ServiceModelListParams, EventModelListOnSuccessParams, EventModelListOnErrorParams, MainModelListParams, OllamaModelResponse, OpenaiCompatibleModelResponse, } from './sendLLMMessageTypes.js';
+import { EventLLMMessageOnTextParams, EventLLMMessageOnErrorParams, EventLLMMessageOnFinalMessageParams, ServiceSendLLMMessageParams, MainSendLLMMessageParams, MainLLMMessageAbortParams, ServiceModelListParams, EventModelListOnSuccessParams, EventModelListOnErrorParams, MainModelListParams, OllamaModelResponse, OpenaiCompatibleModelResponse, LLMChatMessage, } from './sendLLMMessageTypes.js';
 
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
@@ -14,6 +14,71 @@ import { Event } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { IVoidSettingsService } from './mcodeSettingsService.js';
 import { IMCPService } from './mcpService.js';
+import { logLongText, LOG_CHUNK_SIZE } from './helpers/ragDebugLog.js';
+
+function stringifyLlmMessageContent(content: unknown): string {
+	if (typeof content === 'string') {
+		return content;
+	}
+	if (content === undefined || content === null) {
+		return '';
+	}
+	try {
+		return JSON.stringify(content, null, 2);
+	} catch {
+		return String(content);
+	}
+}
+
+function formatChatMessageForLog(msg: LLMChatMessage): { role: string; text: string } {
+	if ('parts' in msg) {
+		return { role: msg.role, text: JSON.stringify(msg.parts, null, 2) };
+	}
+	let text = stringifyLlmMessageContent(msg.content);
+	if ('tool_calls' in msg && msg.tool_calls?.length) {
+		text += `\n[tool_calls]: ${JSON.stringify(msg.tool_calls, null, 2)}`;
+	}
+	if ('tool_call_id' in msg && msg.tool_call_id) {
+		text = `[tool_call_id=${msg.tool_call_id}]\n${text}`;
+	}
+	return { role: msg.role, text };
+}
+
+function logOutboundLlmPayload(params: ServiceSendLLMMessageParams, requestId: string): void {
+	const { logging, modelSelection, messagesType, separateSystemMessage, chatMode } = params;
+	const provider = modelSelection?.providerName ?? 'none';
+	const model = modelSelection?.modelName ?? 'none';
+	const extras = logging.loggingExtras ? JSON.stringify(logging.loggingExtras) : '';
+
+	console.log(
+		`[LLM][send] requestId=${requestId} name=${logging.loggingName} type=${messagesType} `
+		+ `model=${provider}/${model} chatMode=${chatMode ?? 'n/a'}${extras ? ` extras=${extras}` : ''}`,
+	);
+
+	if (separateSystemMessage?.trim()) {
+		logLongText('[LLM][send] separateSystemMessage', separateSystemMessage, LOG_CHUNK_SIZE);
+	}
+
+	if (messagesType === 'chatMessages') {
+		const messages = params.messages;
+		let totalChars = separateSystemMessage?.length ?? 0;
+		console.log(`[LLM][send] messages count=${messages.length}`);
+		for (let i = 0; i < messages.length; i++) {
+			const { role, text } = formatChatMessageForLog(messages[i]);
+			totalChars += text.length;
+			logLongText(`[LLM][send] message[${i}] role=${role}`, text, LOG_CHUNK_SIZE);
+		}
+		console.log(`[LLM][send] payload totalChars≈${totalChars}`);
+	} else {
+		const { prefix, suffix, stopTokens } = params.messages;
+		console.log(
+			`[LLM][send] FIM prefixChars=${prefix.length} suffixChars=${suffix.length} `
+			+ `stopTokens=${JSON.stringify(stopTokens)}`,
+		);
+		logLongText('[LLM][send] FIM prefix', prefix, LOG_CHUNK_SIZE);
+		logLongText('[LLM][send] FIM suffix', suffix, LOG_CHUNK_SIZE);
+	}
+}
 
 // calls channel to implement features
 export const ILLMMessageService = createDecorator<ILLMMessageService>('llmMessageService');
@@ -24,6 +89,8 @@ export interface ILLMMessageService {
 	abort: (requestId: string) => void;
 	ollamaList: (params: ServiceModelListParams<OllamaModelResponse>) => void;
 	openAICompatibleList: (params: ServiceModelListParams<OpenaiCompatibleModelResponse>) => void;
+	/** llama-server GET /props → n_ctx; null if not a llama-server or unreachable. */
+	fetchLlamaServerContextWindow: (endpoint: string) => Promise<number | null>;
 }
 
 
@@ -127,6 +194,8 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 		this.llmMessageHooks.onError[requestId] = onError
 		this.llmMessageHooks.onAbort[requestId] = onAbort // used internally only
 
+		logOutboundLlmPayload(params, requestId);
+
 		// params will be stripped of all its functions over the IPC channel
 		this.channel.call('sendLLMMessage', {
 			...proxyParams,
@@ -180,6 +249,15 @@ export class LLMMessageService extends Disposable implements ILLMMessageService 
 			settingsOfProvider,
 			requestId: requestId_,
 		} satisfies MainModelListParams<OpenaiCompatibleModelResponse>)
+	}
+
+	fetchLlamaServerContextWindow = async (endpoint: string): Promise<number | null> => {
+		try {
+			const nCtx = await this.channel.call('fetchLlamaServerContextWindow', { endpoint });
+			return typeof nCtx === 'number' && nCtx > 0 ? nCtx : null;
+		} catch {
+			return null;
+		}
 	}
 
 	private _clearChannelHooks(requestId: string) {

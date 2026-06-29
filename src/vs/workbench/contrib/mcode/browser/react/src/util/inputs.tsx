@@ -1855,31 +1855,17 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 
 	const languageSelection = useMemo(() => languageService.createById(lang), [lang, languageService]);
 
-	// Create models for original and modified
-	const originalModel = useMemo(() =>
-		modelService.createModel(block.orig, languageSelection),
-		[block.orig, languageSelection, modelService]
-	);
-	const modifiedModel = useMemo(() =>
-		modelService.createModel(block.final, languageSelection),
-		[block.final, languageSelection, modelService]
-	);
-
-	// Clean up models on unmount
-	useEffect(() => {
-		return () => {
-			originalModel.dispose();
-			modifiedModel.dispose();
-		};
-	}, [originalModel, modifiedModel]);
-
-	// Imperatively mount the DiffEditorWidget
 	const divRef = useRef<HTMLDivElement | null>(null);
-	const editorRef = useRef<any>(null);
 
+	// Keep models and editor in one effect so cleanup always detaches models before disposing them.
 	useEffect(() => {
-		if (!divRef.current) return;
-		// Create the diff editor instance
+		if (!divRef.current) {
+			return;
+		}
+
+		const originalModel = modelService.createModel(block.orig, languageSelection);
+		const modifiedModel = modelService.createModel(block.final, languageSelection);
+
 		const editor = instantiationService.createInstance(
 			DiffEditorWidget,
 			divRef.current,
@@ -1914,14 +1900,12 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 		);
 		editor.setModel({ original: originalModel, modified: modifiedModel });
 
-		// Calculate the height based on content
 		const updateHeight = () => {
 			const contentHeight = Math.max(
-				originalModel.getLineCount() * 19, // approximate line height
+				originalModel.getLineCount() * 19,
 				modifiedModel.getLineCount() * 19
-			) + 19 * 2 + 1; // add padding
+			) + 19 * 2 + 1;
 
-			// Set reasonable min/max heights
 			const height = Math.min(Math.max(contentHeight, 100), 300);
 			if (divRef.current) {
 				divRef.current.style.height = `${height}px`;
@@ -1930,19 +1914,19 @@ const SingleDiffEditor = ({ block, lang }: { block: ExtractedSearchReplaceBlock,
 		};
 
 		updateHeight();
-		editorRef.current = editor;
 
-		// Update height when content changes
 		const disposable1 = originalModel.onDidChangeContent(() => updateHeight());
 		const disposable2 = modifiedModel.onDidChangeContent(() => updateHeight());
 
 		return () => {
 			disposable1.dispose();
 			disposable2.dispose();
+			editor.setModel(null);
 			editor.dispose();
-			editorRef.current = null;
+			originalModel.dispose();
+			modifiedModel.dispose();
 		};
-	}, [originalModel, modifiedModel, instantiationService]);
+	}, [block.orig, block.final, languageSelection, modelService, instantiationService]);
 
 	return (
 		<div className="w-full bg-void-bg-3 @@bg-editor-style-override" ref={divRef} />

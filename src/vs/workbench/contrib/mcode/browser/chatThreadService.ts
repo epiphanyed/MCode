@@ -41,11 +41,25 @@ import { IFileService } from '../../../../platform/files/common/files.js';
 import { IMCPService } from '../common/mcpService.js';
 import { RawMCPToolCall } from '../common/mcpServiceTypes.js';
 import { IGenerateCommitMessageService } from './mcodeSCMService.js';
-import { IVoidRagService, defaultRagQueryOptions, DEFAULT_RAG_EMBEDDING } from '../common/mcodeRagTypes.js';
+import { IVoidRagService, defaultRagQueryOptions } from '../common/mcodeRagTypes.js';
+import { startMcodeRagBootstrap } from './mcodeRagBootstrap.js';
 import { IVoidDiagramService } from '../common/mcodeDiagramTypes.js';
 import { IContextGatheringService } from './contextGatheringService.js';
 import { ICodeEditorService } from '../../../../editor/browser/services/codeEditorService.js';
 import { mergeRagContexts, filePathsFromStagingSelections } from '../common/helpers/ragContextMerger.js';
+import { ragLogBody, ragLogElapsed, ragLogJson, ragLogStage } from '../common/helpers/ragDebugLog.js';
+import { compactAgentChatMessagesForLlm } from '../common/helpers/agentContextCompaction.js';
+import {
+	agentReadRegistryKey,
+	alreadyReadToolResult,
+	appendAgentReadRegistry,
+	isAgentReadRegistered,
+	rebuildAgentReadRegistryFromMessages,
+	stubAlreadyReadToolResult,
+} from '../common/helpers/agentReadRegistry.js';
+import { shouldDeferAgentEditReview } from '../common/helpers/agentDeferredEditReview.js';
+import { taskPlanItemKey } from '../common/helpers/taskPlanParser.js';
+import { ILlamaServerContextService } from '../common/llamaServerContextService.js';
 
 
 // related to retrying when LLM message has error
@@ -139,6 +153,17 @@ export type ThreadType = {
 			}
 		}
 
+		/** Keys of read_file / read_files calls already executed in this thread (path + page). */
+		agentReadRegistry: string[];
+
+		/** fsPaths touched by deferred agent edits in the current agent run (for batch review). */
+		agentDeferredEditUris: string[];
+
+		/** `${messageIdx}:${itemId}` → user-checked state for task plan items. */
+		taskPlanChecked: Record<string, boolean>;
+
+		/** `${messageIdx}` → collapsed state for task plan panels. */
+		taskPlanCollapsed: Record<string, boolean>;
 
 		mountedInfo?: {
 			whenMounted: Promise<WhenMounted>
@@ -164,6 +189,7 @@ export type IsRunningType =
 	| 'LLM' // the LLM is currently streaming
 	| 'tool' // whether a tool is currently running
 	| 'awaiting_user' // awaiting user call
+	| 'awaiting_batch_review' // agent finished; pending diff changes need batch accept/reject
 	| 'idle' // nothing is running now, but the chat should still appear like it's going (used in-between calls)
 	| undefined
 
@@ -204,6 +230,12 @@ export type ThreadStreamState = {
 		toolInfo?: undefined;
 		interrupt?: undefined;
 	} | {
+		isRunning: 'awaiting_batch_review';
+		error?: undefined;
+		llmInfo?: undefined;
+		toolInfo?: undefined;
+		interrupt?: undefined;
+	} | {
 		isRunning: 'idle';
 		error?: undefined;
 		llmInfo?: undefined;
@@ -224,6 +256,10 @@ const newThreadObject = () => {
 			stagingSelections: [],
 			focusedMessageIdx: undefined,
 			linksOfMessageIdx: {},
+			agentReadRegistry: [],
+			agentDeferredEditUris: [],
+			taskPlanChecked: {},
+			taskPlanCollapsed: {},
 		},
 		filesWithUserChanges: new Set()
 	} satisfies ThreadType
@@ -296,6 +332,16 @@ export interface IChatThreadService {
 	approveLatestToolRequest(threadId: string): void;
 	rejectLatestToolRequest(threadId: string): void;
 
+	acceptAllDeferredEdits(threadId: string): void;
+	rejectAllDeferredEdits(threadId: string): void;
+	dismissDeferredEditReview(threadId: string): void;
+
+	getTaskPlanItemChecked(threadId: string, messageIdx: number, itemId: string, defaultChecked: boolean): boolean;
+	setTaskPlanItemChecked(threadId: string, messageIdx: number, itemId: string, checked: boolean): void;
+	toggleTaskPlanItem(threadId: string, messageIdx: number, itemId: string, defaultChecked: boolean): void;
+	isTaskPlanCollapsed(threadId: string, messageIdx: number): boolean;
+	setTaskPlanCollapsed(threadId: string, messageIdx: number, collapsed: boolean): void;
+
 	// jump to history
 	jumpToCheckpointBeforeMessageIdx(opts: { threadId: string, messageIdx: number, jumpToUserModified: boolean }): void;
 
@@ -319,6 +365,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 	/** Per user-message RAG cache — avoids re-query on each Agent tool-loop iteration. */
 	private readonly _hybridRagContextCache = new Map<string, string | null>()
+	private readonly _ragInitPromise: Promise<void>
 
 	// used in checkpointing
 	// private readonly _userModifiedFilesToCheckInCheckpoints = new LRUCache<string, null>(50)
@@ -345,11 +392,31 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		@IVoidDiagramService private readonly _mcodeDiagramService: IVoidDiagramService,
 		@IContextGatheringService private readonly _contextGatheringService: IContextGatheringService,
 		@ICodeEditorService private readonly _codeEditorService: ICodeEditorService,
+		@ILlamaServerContextService private readonly _llamaServerContextService: ILlamaServerContextService,
 	) {
 		super()
 		this.state = { allThreads: {}, currentThreadId: null as unknown as string } // default state
 
 		const readThreads = this._readAllThreads() || {}
+
+		for (const threadId in readThreads) {
+			const t = readThreads[threadId]
+			if (!t) {
+				continue
+			}
+			if (!Array.isArray(t.state.agentReadRegistry)) {
+				t.state.agentReadRegistry = rebuildAgentReadRegistryFromMessages(t.messages)
+			}
+			if (!Array.isArray(t.state.agentDeferredEditUris)) {
+				t.state.agentDeferredEditUris = []
+			}
+			if (!t.state.taskPlanChecked || typeof t.state.taskPlanChecked !== 'object') {
+				t.state.taskPlanChecked = {}
+			}
+			if (!t.state.taskPlanCollapsed || typeof t.state.taskPlanCollapsed !== 'object') {
+				t.state.taskPlanCollapsed = {}
+			}
+		}
 
 		const allThreads = readThreads
 		this.state = {
@@ -359,7 +426,7 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// always be in a thread
 		this.openNewThread()
-		void this._initRagWhenSettingsReady();
+		this._ragInitPromise = startMcodeRagBootstrap(this._settingsService, this._workspaceContextService, this._mcodeRagService);
 
 
 		// keep track of user-modified files
@@ -591,6 +658,86 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		)
 	}
 
+	private _uriHasPendingDiffChanges(uri: URI): boolean {
+		for (const diffareaid of this._editCodeService.diffAreasOfURI[uri.fsPath] ?? []) {
+			const diffArea = this._editCodeService.diffAreaOfId[diffareaid]
+			if (diffArea?.type === 'DiffZone' && Object.keys(diffArea._diffOfId).length > 0) {
+				return true
+			}
+		}
+		return false
+	}
+
+	private _getDeferredEditUrisWithPendingChanges(threadId: string): URI[] {
+		const fsPaths = this.state.allThreads[threadId]?.state.agentDeferredEditUris ?? []
+		return fsPaths
+			.filter(fsPath => this._uriHasPendingDiffChanges(URI.file(fsPath)))
+			.map(fsPath => URI.file(fsPath))
+	}
+
+	private _hasPendingDeferredEdits(threadId: string): boolean {
+		if (!this._settingsService.state.globalSettings.agentDeferredEditReview) return false
+		if (this._settingsService.state.globalSettings.chatMode !== 'agent') return false
+		return this._getDeferredEditUrisWithPendingChanges(threadId).length > 0
+	}
+
+	private _trackDeferredAgentEditUri(threadId: string, uri: URI) {
+		const { chatMode, agentDeferredEditReview } = this._settingsService.state.globalSettings
+		if (!shouldDeferAgentEditReview(chatMode, agentDeferredEditReview, 'edit_file')) return
+		const current = this.state.allThreads[threadId]?.state.agentDeferredEditUris ?? []
+		if (current.includes(uri.fsPath)) return
+		this._setThreadState(threadId, { agentDeferredEditUris: [...current, uri.fsPath] })
+	}
+
+	dismissDeferredEditReview(threadId: string) {
+		if (this.streamState[threadId]?.isRunning === 'awaiting_batch_review') {
+			this._setStreamState(threadId, undefined)
+		}
+		this._setThreadState(threadId, { agentDeferredEditUris: [] })
+	}
+
+	acceptAllDeferredEdits(threadId: string) {
+		for (const uri of this._getDeferredEditUrisWithPendingChanges(threadId)) {
+			this._editCodeService.acceptOrRejectAllDiffAreas({ uri, behavior: 'accept', removeCtrlKs: false })
+		}
+		this.dismissDeferredEditReview(threadId)
+		this._metricsService.capture('Agent Deferred Edit Accept All', {})
+	}
+
+	rejectAllDeferredEdits(threadId: string) {
+		for (const uri of this._getDeferredEditUrisWithPendingChanges(threadId)) {
+			this._editCodeService.acceptOrRejectAllDiffAreas({ uri, behavior: 'reject', removeCtrlKs: false })
+		}
+		this.dismissDeferredEditReview(threadId)
+		this._metricsService.capture('Agent Deferred Edit Reject All', {})
+	}
+
+	getTaskPlanItemChecked(threadId: string, messageIdx: number, itemId: string, defaultChecked: boolean): boolean {
+		const key = taskPlanItemKey(messageIdx, itemId)
+		const stored = this.state.allThreads[threadId]?.state.taskPlanChecked[key]
+		return stored !== undefined ? stored : defaultChecked
+	}
+
+	setTaskPlanItemChecked(threadId: string, messageIdx: number, itemId: string, checked: boolean) {
+		const key = taskPlanItemKey(messageIdx, itemId)
+		const current = this.state.allThreads[threadId]?.state.taskPlanChecked ?? {}
+		this._setThreadState(threadId, { taskPlanChecked: { ...current, [key]: checked } })
+	}
+
+	toggleTaskPlanItem(threadId: string, messageIdx: number, itemId: string, defaultChecked: boolean) {
+		const current = this.getTaskPlanItemChecked(threadId, messageIdx, itemId, defaultChecked)
+		this.setTaskPlanItemChecked(threadId, messageIdx, itemId, !current)
+	}
+
+	isTaskPlanCollapsed(threadId: string, messageIdx: number): boolean {
+		return !!this.state.allThreads[threadId]?.state.taskPlanCollapsed[String(messageIdx)]
+	}
+
+	setTaskPlanCollapsed(threadId: string, messageIdx: number, collapsed: boolean) {
+		const current = this.state.allThreads[threadId]?.state.taskPlanCollapsed ?? {}
+		this._setThreadState(threadId, { taskPlanCollapsed: { ...current, [String(messageIdx)]: collapsed } })
+	}
+
 	private _computeMCPServerOfToolName = (toolName: string) => {
 		return this._mcpService.getMCPTools()?.find(t => t.name === toolName)?.mcpServerName
 	}
@@ -614,6 +761,9 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		// reject the tool for the user if relevant
 		else if (this.streamState[threadId]?.isRunning === 'awaiting_user') {
 			this.rejectLatestToolRequest(threadId)
+		}
+		else if (this.streamState[threadId]?.isRunning === 'awaiting_batch_review') {
+			this.dismissDeferredEditReview(threadId)
 		}
 		else if (this.streamState[threadId]?.isRunning === 'idle') {
 			// do nothing
@@ -690,10 +840,12 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 				}
 			}
 			if (approvalType) {
-				const autoApprove = this._settingsService.state.globalSettings.autoApprove[approvalType]
+				const { chatMode, agentDeferredEditReview, autoApprove } = this._settingsService.state.globalSettings
+				const deferEditReview = shouldDeferAgentEditReview(chatMode, agentDeferredEditReview, toolName)
+				const shouldAutoApprove = autoApprove[approvalType] || deferEditReview
 				// add a tool_request because we use it for UI if a tool is loading (this should be improved in the future)
 				this._addMessageToThread(threadId, { role: 'tool', type: 'tool_request', content: '(Awaiting user permission...)', result: null, name: toolName, params: toolParams, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
-				if (!autoApprove) {
+				if (!shouldAutoApprove) {
 					return { awaitingUserApproval: true }
 				}
 			}
@@ -702,10 +854,47 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			toolParams = opts.validatedParams
 		}
 
+		// Correct range-based pagination mistake: if startLine/endLine is specified and pageNumber > 1,
+		// but there is no previous read of pageNumber-1 for this exact range in this thread, override pageNumber to 1.
+		if (isBuiltInTool && toolName === 'read_file') {
+			const p = toolParams as BuiltinToolCallParams['read_file'];
+			if (p.pageNumber > 1 && (p.startLine !== null || p.endLine !== null)) {
+				const thread = this.state.allThreads[threadId];
+				const hasPreviousPage1 = thread?.messages.some(m => {
+					if (m.role === 'tool' && m.type === 'success' && m.name === 'read_file') {
+						const prevP = m.params as BuiltinToolCallParams['read_file'];
+						return prevP.uri.fsPath.toLowerCase() === p.uri.fsPath.toLowerCase() &&
+							prevP.startLine === p.startLine &&
+							prevP.endLine === p.endLine &&
+							prevP.pageNumber === p.pageNumber - 1;
+					}
+					return false;
+				});
+				if (!hasPreviousPage1) {
+					p.pageNumber = 1;
+				}
+			}
+		}
 
-
-
-
+		// Block duplicate read_file / read_files using per-thread read registry
+		if (isBuiltInTool && (toolName === 'read_file' || toolName === 'read_files')) {
+			const readToolName = toolName
+			const readParams = toolParams as BuiltinToolCallParams['read_file'] | BuiltinToolCallParams['read_files']
+			const registryKey = agentReadRegistryKey(readToolName, readParams)
+			const registry = this.state.allThreads[threadId]?.state.agentReadRegistry ?? []
+			if (isAgentReadRegistered(registry, registryKey)) {
+				const toolResultStr = alreadyReadToolResult(readToolName, readParams)
+				ragLogStage('read-registry', `skipped duplicate ${readToolName} key=${registryKey}`)
+				this._updateLatestTool(threadId, { role: 'tool', type: 'running_now', name: toolName, params: toolParams, content: '(already read...)', result: null, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+				this._updateLatestTool(threadId, {
+					role: 'tool', type: 'success', params: toolParams,
+					result: stubAlreadyReadToolResult(readToolName),
+					name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName,
+				})
+				await this._triggerAutoCommit(toolName)
+				return {}
+			}
+		}
 
 		// 3. call the tool
 		// this._setStreamState(threadId, { isRunning: 'tool' }, 'merge')
@@ -770,6 +959,18 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 		// 5. add to history and keep going
 		this._updateLatestTool(threadId, { role: 'tool', type: 'success', params: toolParams, result: toolResult, name: toolName, content: toolResultStr, id: toolId, rawParams: opts.unvalidatedToolParams, mcpServerName })
+		if (isBuiltInTool && (toolName === 'read_file' || toolName === 'read_files')) {
+			const readToolName = toolName
+			const readParams = toolParams as BuiltinToolCallParams['read_file'] | BuiltinToolCallParams['read_files']
+			const registryKey = agentReadRegistryKey(readToolName, readParams)
+			const registry = this.state.allThreads[threadId]?.state.agentReadRegistry ?? []
+			this._setThreadState(threadId, { agentReadRegistry: appendAgentReadRegistry(registry, registryKey) })
+			ragLogStage('read-registry', `registered ${readToolName} key=${registryKey}`)
+		}
+		if (isBuiltInTool && (toolName === 'edit_file' || toolName === 'rewrite_file')) {
+			const editUri = (toolParams as BuiltinToolCallParams['edit_file'] | BuiltinToolCallParams['rewrite_file']).uri
+			this._trackDeferredAgentEditUri(threadId, editUri)
+		}
 		await this._triggerAutoCommit(toolName);
 		return {}
 	};
@@ -826,6 +1027,10 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 		const { chatMode } = this._settingsService.state.globalSettings // should not change as we loop even if user changes it, so it goes here
 		const { overridesOfModel } = this._settingsService.state
 
+		if (modelSelection?.providerName) {
+			void this._llamaServerContextService.syncForProvider(modelSelection.providerName);
+		}
+
 		let nMessagesSent = 0
 		let shouldSendAnotherMessage = true
 		let isRunningWhenEnd: IsRunningType = undefined
@@ -852,9 +1057,35 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 			this._setStreamState(threadId, { isRunning: 'idle', interrupt: idleInterruptor })
 
 			const rawChatMessages = this.state.allThreads[threadId]?.messages ?? []
-			const chatMessages = [...rawChatMessages]
+			let chatMessages = compactAgentChatMessagesForLlm([...rawChatMessages])
+
+			// Sync active agentReadRegistry with the most recent 5 read tools in the chat history
+			const activeReadKeys: string[] = [];
+			const activeReadKeysSet = new Set<string>();
+			for (let i = chatMessages.length - 1; i >= 0; i--) {
+				const m = chatMessages[i];
+				if (m.role === 'tool' && m.type === 'success') {
+					if (m.name === 'read_file') {
+						const p = m.params as BuiltinToolCallParams['read_file'];
+						const key = agentReadRegistryKey('read_file', p);
+						if (!activeReadKeysSet.has(key)) {
+							activeReadKeysSet.add(key);
+							activeReadKeys.push(key);
+						}
+					} else if (m.name === 'read_files') {
+						const p = m.params as BuiltinToolCallParams['read_files'];
+						const key = agentReadRegistryKey('read_files', p);
+						if (!activeReadKeysSet.has(key)) {
+							activeReadKeysSet.add(key);
+							activeReadKeys.push(key);
+						}
+					}
+				}
+			}
+			const activeReadRegistry = activeReadKeys.slice(0, 5);
+			this._setThreadState(threadId, { agentReadRegistry: activeReadRegistry });
 			const lastUserMsgIdx = findLastIdx(chatMessages, m => m.role === 'user')
-			if (lastUserMsgIdx !== -1) {
+			if (nMessagesSent === 1 && lastUserMsgIdx !== -1) {
 				const lastUserMsg = chatMessages[lastUserMsgIdx]
 				if (lastUserMsg.role === 'user') {
 					try {
@@ -870,16 +1101,23 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 								this._hybridRagContextCache.set(cacheKey, context)
 							}
 							if (context) {
+								const injectedContent = `${queryText}\n\n[检索到的代码上下文]:\n${context}`;
+								ragLogStage('inject', `userMsgIdx=${lastUserMsgIdx} queryChars=${queryText.length} contextChars=${context.length} totalChars=${injectedContent.length}`);
+								ragLogBody('inject', 'llmUserMessage', injectedContent);
 								chatMessages[lastUserMsgIdx] = {
 									...lastUserMsg,
-									content: `${queryText}\n\n[检索到的代码上下文]:\n${context}`
+									content: injectedContent,
 								}
+							} else {
+								ragLogStage('inject', 'skipped (no hybrid context)');
 							}
 						}
 					} catch (e) {
 						console.error('[RAG] Query failed:', e)
 					}
 				}
+			} else if (nMessagesSent > 1) {
+				ragLogStage('inject', `skipped agent loop nMessagesSent=${nMessagesSent} (RAG only on first turn)`);
 			}
 
 			const { messages, separateSystemMessage } = await this._convertToLLMMessagesService.prepareLLMChatMessages({
@@ -1014,6 +1252,11 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 
 			} // end while (attempts)
 		} // end while (send message)
+
+		// deferred batch review when agent finished without awaiting tool approval
+		if (!isRunningWhenEnd && this._hasPendingDeferredEdits(threadId)) {
+			isRunningWhenEnd = 'awaiting_batch_review'
+		}
 
 		// if awaiting user approval, keep isRunning true, else end isRunning
 		this._setStreamState(threadId, { isRunning: isRunningWhenEnd })
@@ -1372,6 +1615,9 @@ We only need to do it for files that were edited since `from`, ie files between 
 			await this.abortRunning(threadId)
 		}
 
+		this.dismissDeferredEditReview(threadId)
+		this._setThreadState(threadId, { agentDeferredEditUris: [] })
+
 		// add dummy before this message to keep checkpoint before user message idea consistent
 		if (thread.messages.length === 0) {
 			this._addUserCheckpoint({ threadId })
@@ -1440,6 +1686,10 @@ We only need to do it for files that were edited since `from`, ie files between 
 					...thread,
 					lastModified: new Date().toISOString(),
 					messages: newMessages,
+					state: {
+						...thread.state,
+						agentReadRegistry: rebuildAgentReadRegistryFromMessages(newMessages),
+					},
 				}
 			};
 			this._storeAllThreads(newThreads);
@@ -1470,7 +1720,11 @@ We only need to do it for files that were edited since `from`, ie files between 
 				...this.state.allThreads,
 				[thread.id]: {
 					...thread,
-					messages: slicedMessages
+					messages: slicedMessages,
+					state: {
+						...thread.state,
+						agentReadRegistry: rebuildAgentReadRegistryFromMessages(slicedMessages),
+					},
 				}
 			}
 		})
@@ -1504,6 +1758,12 @@ We only need to do it for files that were edited since `from`, ie files between 
 			else if (m.role === 'tool' && m.type === 'success' && m.name === 'read_file') {
 				const params = m.params as BuiltinToolCallParams['read_file']
 				addURI(params.uri)
+			}
+			else if (m.role === 'tool' && m.type === 'success' && m.name === 'read_files') {
+				const params = m.params as BuiltinToolCallParams['read_files']
+				for (const uri of params.uris) {
+					addURI(uri)
+				}
 			}
 		}
 		return uris
@@ -2099,10 +2359,29 @@ We only need to do it for files that were edited since `from`, ie files between 
 
 		const excludeFilePaths = filePathsFromStagingSelections(stagingSelections)
 
+		ragLogBody('hybrid', 'userQuery', queryText);
+		ragLogJson('hybrid', 'ragOptions', ragOptions);
+		ragLogJson('hybrid', 'excludeFilePaths', excludeFilePaths);
+
+		const tHybrid = Date.now();
+
+		await this._ragInitPromise;
+		const indexReady = await this._mcodeRagService.waitForIndexReady(120_000);
+		ragLogStage('hybrid', `indexReady=${indexReady}`);
+		ragLogElapsed('hybrid', 'index wait', tHybrid);
+
+		const tQuery = Date.now();
+		ragLogStage('hybrid', 'queryContext start (embedding + vector search on main process…)');
 		const [vectorContext, lspSnippets] = await Promise.all([
 			this._mcodeRagService.queryContext(queryText, ragOptions),
 			this._refreshLspSnippets(),
-		])
+		]);
+		ragLogElapsed('hybrid', 'queryContext done', tQuery);
+
+		ragLogStage('hybrid', `vectorContextChars=${vectorContext.length} lspSnippets=${lspSnippets.length}`);
+		for (let i = 0; i < lspSnippets.length; i++) {
+			ragLogBody('hybrid', `lspSnippet[${i}]`, lspSnippets[i]);
+		}
 
 		const { merged, hasLsp, hasVector } = mergeRagContexts({
 			lspSnippets,
@@ -2115,44 +2394,13 @@ We only need to do it for files that were edited since `from`, ie files between 
 			excludeFilePaths,
 		})
 
+		ragLogStage('hybrid', `hasLsp=${hasLsp} hasVector=${hasVector} mergedChars=${merged.length}`);
 		if (!hasLsp && !hasVector) {
+			ragLogStage('hybrid', 'no context to inject');
 			return null
 		}
+		ragLogBody('hybrid', 'finalMergedContext', merged);
 		return merged
-	}
-
-	private async _initRagWhenSettingsReady(): Promise<void> {
-		await this._settingsService.waitForInitState;
-		await this._initRag();
-	}
-
-	private async _initRag() {
-		const workspace = this._workspaceContextService.getWorkspace();
-		const folder = workspace.folders[0];
-		if (folder) {
-			const workspaceRoot = folder.uri.fsPath;
-			const workspaceHash = workspace.id;
-			const indexType = this._settingsService.state.globalSettings.indexType || 'local';
-			const useMilvus = indexType === 'milvus';
-			const milvusConfig = {
-				address: this._settingsService.state.globalSettings.milvusUrl || 'localhost:19530',
-				username: this._settingsService.state.globalSettings.milvusUsername || '',
-				password: this._settingsService.state.globalSettings.milvusPassword || '',
-			};
-			const embeddingConfig = {
-				provider: this._settingsService.state.globalSettings.embeddingProvider ?? DEFAULT_RAG_EMBEDDING.provider,
-				model: this._settingsService.state.globalSettings.embeddingModel ?? DEFAULT_RAG_EMBEDDING.model,
-				ollamaEndpoint: this._settingsService.state.globalSettings.ollamaEndpoint ?? DEFAULT_RAG_EMBEDDING.ollamaEndpoint,
-			};
-			try {
-				const actualType = await this._mcodeRagService.initializeIndex(workspaceRoot, workspaceHash, useMilvus, milvusConfig, embeddingConfig, {
-					milvusDualWrite: this._settingsService.state.globalSettings.ragMilvusDualWrite ?? false,
-				});
-				console.log(`[RAG] Index initialized successfully (${actualType} mode)`);
-			} catch (e) {
-				console.error('[RAG] Failed to initialize index:', e);
-			}
-		}
 	}
 
 	private async _validateAndSelfRepairDiagrams(

@@ -44,6 +44,7 @@ export const toolApprovalTypes = new Set<ToolApprovalType>([
 // PARAMS OF TOOL CALL
 export type BuiltinToolCallParams = {
 	'read_file': { uri: URI, startLine: number | null, endLine: number | null, pageNumber: number },
+	'read_files': { uris: URI[], pageNumber: number },
 	'ls_dir': { uri: URI, pageNumber: number },
 	'get_dir_tree': { uri: URI },
 	'search_pathnames_only': { query: string, includePattern: string | null, pageNumber: number },
@@ -65,6 +66,12 @@ export type BuiltinToolCallParams = {
 // RESULT OF TOOL CALL
 export type BuiltinToolResultType = {
 	'read_file': { fileContents: string, totalFileLen: number, totalNumLines: number, hasNextPage: boolean },
+	'read_files': {
+		combinedContents: string,
+		totalCombinedLen: number,
+		hasNextPage: boolean,
+		files: Array<{ uri: URI, totalNumLines: number, totalFileLen: number, error?: string }>,
+	},
 	'ls_dir': { children: ShallowDirectoryItem[] | null, hasNextPage: boolean, hasPrevPage: boolean, itemsRemaining: number },
 	'get_dir_tree': { str: string, },
 	'search_pathnames_only': { uris: URI[], hasNextPage: boolean },

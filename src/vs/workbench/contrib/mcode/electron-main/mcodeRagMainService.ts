@@ -108,6 +108,12 @@ export class VoidRagService implements IVoidRagService {
 
 	}
 
+	async waitForIndexReady(timeoutMs?: number): Promise<boolean> {
+
+		return this.llamaIndexService.waitForIndexReady(timeoutMs);
+
+	}
+
 	getRelatedDependencies(filePath: string, maxResults?: number): Promise<RagRelatedDependency[]> {
 
 		return Promise.resolve(this.llamaIndexService.getRelatedDependencies(filePath, maxResults));

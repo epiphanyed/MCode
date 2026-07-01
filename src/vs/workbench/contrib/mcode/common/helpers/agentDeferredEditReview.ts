@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ChatMode } from '../mcodeSettingsTypes.js';
-import { BuiltinToolName } from '../toolsServiceTypes.js';
 
 export function isAgentDeferredEditTool(toolName: string): toolName is 'edit_file' | 'rewrite_file' {
 	return toolName === 'edit_file' || toolName === 'rewrite_file';

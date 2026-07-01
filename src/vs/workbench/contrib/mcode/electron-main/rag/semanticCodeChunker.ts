@@ -25,7 +25,7 @@ export interface SemanticCodeChunk {
 /** Maximum lines per chunk before secondary split (Phase 3). */
 export const MAX_SYMBOL_LINES = 512;
 
-type LanguageFamily = 'cpp' | 'typescript' | 'javascript' | 'python' | 'scilab' | 'matlab' | 'java' | 'go' | 'rust' | 'csharp' | 'ruby' | 'unknown';
+type LanguageFamily = 'cpp' | 'typescript' | 'javascript' | 'python' | 'scilab' | 'matlab' | 'java' | 'go' | 'rust' | 'csharp' | 'ruby' | 'kotlin' | 'unknown';
 
 const EXT_TO_LANGUAGE: Record<string, LanguageFamily> = {
 	'.c': 'cpp',
@@ -47,6 +47,8 @@ const EXT_TO_LANGUAGE: Record<string, LanguageFamily> = {
 	'.rs': 'rust',
 	'.cs': 'csharp',
 	'.rb': 'ruby',
+	'.kt': 'kotlin',
+	'.kts': 'kotlin',
 };
 
 interface PatternDef {
@@ -54,6 +56,7 @@ interface PatternDef {
 	regex: RegExp;
 	hasBlock?: boolean;
 	endAtSemicolon?: boolean;
+	endAtLine?: boolean;
 	isArrow?: boolean;
 }
 
@@ -86,6 +89,18 @@ const JS_PATTERNS: PatternDef[] = [
 	{ type: 'method', regex: /^\s*(?:async\s+)?[\w$]+\s*\([^)]*\)\s*\{/gm, hasBlock: true },
 ];
 
+const KT_MODIFIER = '(?:(?:private|public|protected|internal|external|override|suspend|inline|tailrec|operator|infix|data|sealed|abstract|open|const|lateinit|final)\\s+)*';
+
+const KT_PATTERNS: PatternDef[] = [
+	{ type: 'enum', regex: /\benum\s+class\s+[\w$]+/g, hasBlock: true },
+	{ type: 'interface', regex: new RegExp(`\\b${KT_MODIFIER}interface\\s+[\\w$]+`, 'g'), hasBlock: true },
+	{ type: 'class', regex: new RegExp(`\\b${KT_MODIFIER}(?:data\\s+|sealed\\s+|abstract\\s+|open\\s+)?(?:class|object)\\s+[\\w$]+`, 'g'), hasBlock: true },
+	{ type: 'function', regex: new RegExp(`\\b${KT_MODIFIER}fun\\s+[\\w$` + '`' + `]+`, 'g'), hasBlock: true },
+	{ type: 'function', regex: new RegExp(`\\b${KT_MODIFIER}fun\\s+[\\w$` + '`' + `]+\\s*(?:\\([^)]*\\))?\\s*=`, 'g'), endAtLine: true },
+	{ type: 'property', regex: /\b(?:val|var)\s+[\w$]+(?:\s*:[^=]+)?\s*=[^\n{]+/g, endAtLine: true },
+	{ type: 'property', regex: /\b(?:val|var)\s+[\w$]+(?:\s*:[^={]+)?\s*\{/g, hasBlock: true },
+];
+
 function getLanguageFamily(filePath: string): LanguageFamily {
 	return EXT_TO_LANGUAGE[path.extname(filePath).toLowerCase()] ?? 'unknown';
 }
@@ -95,6 +110,7 @@ function getPatterns(family: LanguageFamily): PatternDef[] {
 		case 'cpp': return CPP_PATTERNS;
 		case 'typescript': return TS_PATTERNS;
 		case 'javascript': return JS_PATTERNS;
+		case 'kotlin': return KT_PATTERNS;
 		default: return [];
 	}
 }
@@ -106,12 +122,13 @@ function lineNumberAt(content: string, index: number): number {
 function extractSymbolName(matchText: string, type: string): string | undefined {
 	const patterns: Record<string, RegExp> = {
 		struct: /\bstruct(?:\s+[\w:]+)?\s+([\w:]+)/,
-		class: /\bclass\s+([\w:$]+)/,
+		class: /\b(?:class|object)\s+([\w:$]+)/,
 		enum: /\b(?:enum\s+class|enum\s+struct|enum)\s+([\w:$]+)/,
 		union: /\bunion\s+([\w:]+)/,
 		namespace: /\bnamespace\s+([\w:]+)/,
-		function: /\b(?:const|let|var)\s+([\w$]+)\s*=|\bfunction\s+([\w:$]+)|\b([\w:$]+)\s*\(/,
+		function: /\b(?:const|let|var)\s+([\w$]+)\s*=|\b(?:function|fun)\s+([\w:$]+)|\b([\w:$]+)\s*\(/,
 		interface: /\binterface\s+([\w$]+)/,
+		property: /\b(?:val|var)\s+([\w$]+)/,
 		record: /\brecord\s+([\w$]+)/,
 		type: /\btype\s+([\w$]+)/,
 		method: /\b([\w$]+)\s*\(/,
@@ -229,6 +246,10 @@ function findSemicolonEnd(content: string, startIndex: number): number {
 function resolveMatchEnd(content: string, matchStart: number, pattern: PatternDef): number | null {
 	if (pattern.endAtSemicolon) {
 		return findSemicolonEnd(content, matchStart);
+	}
+	if (pattern.endAtLine) {
+		const nl = content.indexOf('\n', matchStart);
+		return nl === -1 ? content.length : nl + 1;
 	}
 	if (!pattern.hasBlock) {
 		return null;

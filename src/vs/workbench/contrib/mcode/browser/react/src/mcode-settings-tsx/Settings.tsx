@@ -392,6 +392,7 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 	const [showCheckmark, setShowCheckmark] = useState(false);
 	const [userChosenProviderName, setUserChosenProviderName] = useState<ProviderName | null>(null);
 	const [modelName, setModelName] = useState<string>('');
+	const [contextWindowVal, setContextWindowVal] = useState<string>('');
 	const [errorString, setErrorString] = useState('');
 
 	// a dump of all the enabled providers' models
@@ -429,12 +430,22 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 		}
 
 		settingsStateService.addModel(userChosenProviderName, modelName);
+		if (contextWindowVal) {
+			const parsedCtx = parseInt(contextWindowVal, 10);
+			if (!isNaN(parsedCtx) && parsedCtx > 0) {
+				settingsStateService.setOverridesOfModel(userChosenProviderName, modelName, {
+					contextWindow: parsedCtx,
+				});
+			}
+		}
+
 		setShowCheckmark(true);
 		setTimeout(() => {
 			setShowCheckmark(false);
 			setIsAddModelOpen(false);
 			setUserChosenProviderName(null);
 			setModelName('');
+			setContextWindowVal('');
 		}, 1500);
 		setErrorString('');
 	};
@@ -559,6 +570,17 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 						/>
 					</ErrorBoundary>
 
+					{/* Context window input */}
+					<ErrorBoundary>
+						<VoidSimpleInputBox
+							value={contextWindowVal}
+							compact={true}
+							onChangeValue={setContextWindowVal}
+							placeholder='Context Window'
+							className='max-w-32'
+						/>
+					</ErrorBoundary>
+
 					{/* Add button */}
 					<ErrorBoundary>
 						<AddButton
@@ -575,6 +597,7 @@ export const ModelDump = ({ filteredProviders }: { filteredProviders?: ProviderN
 							setIsAddModelOpen(false);
 							setErrorString('');
 							setModelName('');
+							setContextWindowVal('');
 							setUserChosenProviderName(null);
 						}}
 						className='text-void-fg-4'
@@ -1223,7 +1246,7 @@ const IndexSettingsSection = () => {
 
 	const isIndexRunning = ragIndexState.phase !== 'idle'
 	const progressPercent = ragIndexState.filesTotal > 0
-		? Math.round((ragIndexState.filesDone / ragIndexState.filesTotal) * 100)
+		? Math.min(100, Math.round((ragIndexState.filesDone / ragIndexState.filesTotal) * 100))
 		: null
 
 	useEffect(() => {
@@ -1274,29 +1297,38 @@ const IndexSettingsSection = () => {
 		setTimeout(fn, 0)
 	}
 
-	const handleSaveAndApplyEmbedding = () => {
+	const handleSaveAndApplyEmbedding = async () => {
 		setEmbeddingApplyFeedback(null)
 
+		const workspace = workspaceContextService.getWorkspace();
+		const folder = workspace.folders[0];
+		if (!folder) {
+			setEmbeddingApplyFeedback({ kind: 'error', message: 'No workspace folder open.' })
+			return
+		}
+		if (!embeddingModel || (embeddingProvider === 'ollama' && !ollamaEndpoint)) {
+			setEmbeddingApplyFeedback({ kind: 'error', message: 'Embedding model name and Ollama endpoint are required.' })
+			return
+		}
+
+		pendingIndexActionRef.current = 'embedding'
+		setEmbeddingApplyFeedback({
+			kind: 'info',
+			message: isIndexRunning
+				? 'Stopping current build and applying new embedding settings…'
+				: 'Saving settings and building index in background…',
+		})
+
 		try {
-			const workspace = workspaceContextService.getWorkspace();
-			const folder = workspace.folders[0];
-			if (!folder) {
-				setEmbeddingApplyFeedback({ kind: 'error', message: 'No workspace folder open.' })
-				return
-			}
-			pendingIndexActionRef.current = 'embedding'
-			setEmbeddingApplyFeedback({ kind: 'info', message: 'Settings saved. Building index in background…' })
-			deferToNextFrame(async () => {
-				await mcodeSettingsService.setGlobalSetting('embeddingProvider', embeddingProvider)
-				await mcodeSettingsService.setGlobalSetting('embeddingModel', embeddingModel)
-				await mcodeSettingsService.setGlobalSetting('ollamaEndpoint', ollamaEndpoint)
-				const actualType = await mcodeRagService.initializeIndex(folder.uri.fsPath, workspace.id, false, undefined, {
-					provider: embeddingProvider,
-					model: embeddingModel,
-					ollamaEndpoint: ollamaEndpoint
-				}, { forceRebuild: true })
-				setActiveIndexType(actualType)
-			})
+			await mcodeSettingsService.setGlobalSetting('embeddingProvider', embeddingProvider)
+			await mcodeSettingsService.setGlobalSetting('embeddingModel', embeddingModel)
+			await mcodeSettingsService.setGlobalSetting('ollamaEndpoint', ollamaEndpoint)
+			const actualType = await mcodeRagService.initializeIndex(folder.uri.fsPath, workspace.id, false, undefined, {
+				provider: embeddingProvider,
+				model: embeddingModel,
+				ollamaEndpoint: ollamaEndpoint
+			}, { forceRebuild: true })
+			setActiveIndexType(actualType)
 		} catch (e) {
 			pendingIndexActionRef.current = null
 			console.error('Failed to initialize RAG index with new embedding settings:', e);
@@ -1344,25 +1376,30 @@ const IndexSettingsSection = () => {
 		}
 	}
 
-	const handleRebuildLocalIndex = () => {
+	const handleRebuildLocalIndex = async () => {
 		setRebuildFeedback(null)
 
+		const workspace = workspaceContextService.getWorkspace();
+		const folder = workspace.folders[0];
+		if (!folder) {
+			setRebuildFeedback({ kind: 'error', message: 'No workspace folder open.' })
+			return
+		}
+		pendingIndexActionRef.current = 'rebuild'
+		setRebuildFeedback({
+			kind: 'info',
+			message: isIndexRunning
+				? 'Stopping current build and restarting rebuild…'
+				: 'Rebuilding index in background…',
+		})
+
 		try {
-			const workspace = workspaceContextService.getWorkspace();
-			const folder = workspace.folders[0];
-			if (!folder) {
-				setRebuildFeedback({ kind: 'error', message: 'No workspace folder open.' })
-				return
-			}
-			pendingIndexActionRef.current = 'rebuild'
-			setRebuildFeedback({ kind: 'info', message: 'Rebuilding index in background…' })
-			deferToNextFrame(() => {
-				void mcodeRagService.initializeIndex(folder.uri.fsPath, workspace.id, false, undefined, {
-					provider: embeddingProvider,
-					model: embeddingModel,
-					ollamaEndpoint: ollamaEndpoint
-				}, { forceRebuild: true }).then(setActiveIndexType)
-			})
+			const actualType = await mcodeRagService.initializeIndex(folder.uri.fsPath, workspace.id, false, undefined, {
+				provider: embeddingProvider,
+				model: embeddingModel,
+				ollamaEndpoint: ollamaEndpoint
+			}, { forceRebuild: true })
+			setActiveIndexType(actualType)
 		} catch (e) {
 			pendingIndexActionRef.current = null
 			console.error('Failed to initialize local RAG index:', e);
@@ -1534,8 +1571,9 @@ const IndexSettingsSection = () => {
 				<div className="flex flex-col gap-2 mt-2 border-t border-void-border-2 pt-4">
 					<div className="flex items-center gap-4 flex-wrap">
 						<VoidButtonBgDarken
-							onClick={handleSaveAndApplyEmbedding}
-							disabled={isIndexRunning || !embeddingModel || (embeddingProvider === 'ollama' && !ollamaEndpoint)}
+							onClick={() => { void handleSaveAndApplyEmbedding() }}
+							disabled={!embeddingModel || (embeddingProvider === 'ollama' && !ollamaEndpoint)}
+							title={isIndexRunning ? 'Stops the current index build and applies the new embedding model' : undefined}
 							className="px-4 py-2 bg-[#0e70c0] text-white flex items-center gap-2"
 						>
 							<span>Save & Apply Embedding Model</span>
@@ -1766,8 +1804,8 @@ const IndexSettingsSection = () => {
 
 					<div className="flex items-center gap-4 mt-2 border-t border-void-border-2 pt-4">
 						<VoidButtonBgDarken
-							onClick={handleRebuildLocalIndex}
-							disabled={isIndexRunning}
+							onClick={() => { void handleRebuildLocalIndex() }}
+							title={isIndexRunning ? 'Stops the current index build and starts a full rebuild' : undefined}
 							className="px-4 py-2 bg-[#0e70c0] text-white flex items-center gap-2"
 						>
 							{isIndexRunning ? (

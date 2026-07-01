@@ -1716,9 +1716,10 @@ export const BlockCode = ({ initValue, language, maxHeight, showScrollbars }: Bl
 }
 
 
-export const VoidButtonBgDarken = ({ children, disabled, onClick, className }: { children: React.ReactNode; disabled?: boolean; onClick: () => void; className?: string }) => {
+export const VoidButtonBgDarken = ({ children, disabled, onClick, className, title }: { children: React.ReactNode; disabled?: boolean; onClick: () => void; className?: string; title?: string }) => {
 	return <button disabled={disabled}
-		className={`px-3 py-1 bg-black/10 dark:bg-white/10 rounded-sm overflow-hidden whitespace-nowrap flex items-center justify-center ${className || ''}`}
+		title={title}
+		className={`px-3 py-1 bg-black/10 dark:bg-white/10 rounded-sm overflow-hidden whitespace-nowrap flex items-center justify-center transition-all duration-150 enabled:hover:opacity-90 enabled:active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed ${className || ''}`}
 		onClick={onClick}
 	>{children}</button>
 }

@@ -15,7 +15,6 @@ import { OpenAIEmbedding } from "@llamaindex/openai";
 import { Ollama } from "ollama";
 import * as path from 'path';
 import * as fs from 'fs';
-import minimatch from 'minimatch';
 import type {
     RagEmbeddingConfig,
     RagFileChange,
@@ -30,11 +29,13 @@ import type {
     RagMilvusConnectionResult,
     RagQueryOptions,
     RagRelatedDependency,
+    CodeGraphViewPayload,
+    CodeGraphViewOptions,
 } from '../../common/mcodeRagTypes.js';
 import { defaultRagQueryOptions, DEFAULT_RAG_EMBEDDING, OLLAMA_EMBEDDING_DEFAULT_DIMENSIONS, OPENAI_EMBEDDING_DEFAULT_DIMENSIONS } from '../../common/mcodeRagTypes.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
 import { chunkCodeForIndexing, CHUNK_ENGINE, getChunkDocId, MAX_SYMBOL_LINES } from './semanticCodeChunker.js';
-import { pathContainsSkippedDirectory, shouldSkipDirectoryName } from './ragWalkFilters.js';
+import { compareWalkDirectoryNames, getIndexFilePriority, isPathIgnoredByPatterns, pathContainsSkippedDirectory, shouldSkipDirectoryName, sortFilesForIndexing } from './ragWalkFilters.js';
 import { resetTreeSitterLazyProbeCache } from './treeSitterLazy.js';
 import { disposeAllTreeSitterParsers, resetTreeSitterRuntimeForIndexBuild } from './treeSitterRuntime.js';
 import {
@@ -57,13 +58,19 @@ import type { MilvusRagStore } from './milvusStore.js';
 import { createMilvusRagStore, milvusHitToMetadataLazy, nodeToMilvusRecordLazy, testMilvusConnectionLazy } from './milvusLazyModule.js';
 import {
     buildSymbolNameIndex,
+    buildCodeGraphViewPayload,
+    computeFileContentHash,
     createEmptyCodeGraph,
+    ensureGraphAdjacency,
     getRelatedFilesFromGraph,
     mergeFileIntoCodeGraphAsync,
     purgeFileFromCodeGraph,
     CODE_GRAPH_ENGINE,
     type CodeGraph,
 } from './codeGraphBuilder.js';
+import { formatFileRepositoryBlock, formatRepositoryMapBlocks } from './repositoryMapFormatter.js';
+import { CodeGraphSqliteStore, CODE_GRAPH_DB, CODE_GRAPH_SQL_QUERY_NODE_THRESHOLD } from './codeGraphSqliteStore.js';
+import type { RepositoryMapIndexResult } from '../../common/mcodeRagRepositoryMapTypes.js';
 import { compactCodeContent } from './ragCompactFormat.js';
 import {
     appendSectionWithinBudget,
@@ -97,6 +104,7 @@ import {
 import { localVectorRecordToNode, nodeToLocalVectorRecord } from './localVectorRecordMapper.js';
 import { ragLogBody, ragLogElapsed, ragLogJson, ragLogNodes, ragLogStage } from '../../common/helpers/ragDebugLog.js';
 import { stripDiagramBlocksForLlm } from '../../common/helpers/diagramBlockStripper.js';
+import { formatUserFacingEmbeddingError, getEmbeddingErrorText, isFatalEmbeddingError } from './embeddingErrorHelpers.js';
 
 const MANIFEST_VERSION = 6;
 const EMBED_BATCH_SIZE = 32;
@@ -105,6 +113,7 @@ const FILE_CHUNK_MAP_FILENAME = 'file_chunk_map.json';
 const DOC_PARENT_MAP_FILENAME = 'doc_parent_map.json';
 const CODE_SYMBOL_MAP_FILENAME = 'code_symbol_map.json';
 const CODE_GRAPH_MAP_FILENAME = 'code_graph_map.json';
+const CODE_GRAPH_FILE_HASHES_FILENAME = 'code_graph_file_hashes.json';
 const GIT_COMMIT_INDEX_FILENAME = 'git_commit_index.json';
 const BUILD_CHECKPOINT_FILENAME = 'index_build_checkpoint.json';
 const BUILD_CHECKPOINT_VERSION = 1;
@@ -121,7 +130,7 @@ const MAX_INDEXABLE_DOC_FILE_BYTES = 512 * 1024;
 /** Skip code files larger than this. */
 const MAX_INDEXABLE_CODE_FILE_BYTES = 2 * 1024 * 1024;
 const DOC_EXTENSIONS = new Set(['.md', '.txt']);
-const CODE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.cpp', '.h', '.hpp', '.c', '.py', '.sci', '.sce', '.m', '.java']);
+const CODE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.cpp', '.h', '.hpp', '.c', '.py', '.sci', '.sce', '.m', '.java', '.kt', '.kts']);
 interface IndexManifest {
     version: number;
     chunkEngine?: string;
@@ -210,6 +219,9 @@ export class LlamaIndexService {
     private docParentMap: Record<string, string> = {};
     private codeSymbolMap: Record<string, CodeSymbolEntry[]> = {};
     private codeGraph: CodeGraph = createEmptyCodeGraph();
+    private codeGraphFileHashes: Record<string, string> = {};
+    private codeGraphSqliteStore: CodeGraphSqliteStore | null = null;
+    private codeGraphViewPayloadCache: { revision: string; payload: CodeGraphViewPayload } | null = null;
     private symbolNameIndex: Map<string, string[]> = new Map();
     private milvusStore: MilvusRagStore | null = null;
     private milvusConfig: RagMilvusConfig | null = null;
@@ -219,6 +231,8 @@ export class LlamaIndexService {
     private indexBuildTreeSitterPass: TreeSitterIndexPass = 'off';
     private indexFileFailureCount = 0;
     private indexFileFailureSamples: string[] = [];
+    private consecutiveEmbeddingFailures = 0;
+    private lastEmbeddingProbeError: string | null = null;
     private currentPhase: RagIndexPhase = 'idle';
     private filesDone = 0;
     private filesTotal = 0;
@@ -227,6 +241,8 @@ export class LlamaIndexService {
     private lastError: string | null = null;
     private lastIncrementalSync: RagIncrementalSyncEvent | null = null;
     private indexBuildInProgress = false;
+    private indexBuildCancelled = false;
+    private queuedIndexOperation: (() => Promise<void>) | null = null;
     private indexReadyWaiters: Array<(ready: boolean) => void> = [];
     private localIndexBuildDeferHnsw = false;
 
@@ -253,6 +269,19 @@ export class LlamaIndexService {
             await this.localVectorStore.close();
             this.localVectorStore = null;
         }
+    }
+
+    private async closeCodeGraphSqliteStore(): Promise<void> {
+        if (!this.codeGraphSqliteStore) {
+            return;
+        }
+        try {
+            await this.codeGraphSqliteStore.walCheckpoint();
+            await this.codeGraphSqliteStore.close();
+        } catch (err) {
+            console.warn('[RAG] Failed to close code_graph.db:', err);
+        }
+        this.codeGraphSqliteStore = null;
     }
 
     private async ensureLocalVectorStore(dimensions: number): Promise<LocalSqliteVectorStore> {
@@ -292,12 +321,19 @@ export class LlamaIndexService {
     }
 
     /** Schedule long-running index work without blocking the IPC caller. */
-    private runBackgroundIndexOperation(task: () => Promise<void>): void {
+    private runBackgroundIndexOperation(task: () => Promise<void>, options?: { replace?: boolean }): void {
         if (this.indexBuildInProgress) {
-            console.warn('[RAG] Index operation already in progress; ignoring duplicate request.');
+            if (options?.replace) {
+                console.log('[RAG] Cancelling in-progress index build and queueing replacement.');
+                this.indexBuildCancelled = true;
+                this.queuedIndexOperation = task;
+            } else {
+                console.warn('[RAG] Index operation already in progress; ignoring duplicate request.');
+            }
             return;
         }
         this.indexBuildInProgress = true;
+        this.indexBuildCancelled = false;
         this.lastError = null;
         this.fireProgress({
             phase: 'loading',
@@ -314,12 +350,22 @@ export class LlamaIndexService {
                 await this.yieldToEventLoop();
                 await task();
             } catch (err) {
+                if (err instanceof Error && err.message === 'INDEX_BUILD_CANCELLED') {
+                    console.log('[RAG] Index build cancelled for replacement.');
+                    return;
+                }
                 const message = err instanceof Error ? err.message : String(err);
                 this.fireError(message);
             } finally {
                 this.indexBuildInProgress = false;
                 this.localIndexBuildDeferHnsw = false;
-                this.signalIndexReady();
+                const queued = this.queuedIndexOperation;
+                this.queuedIndexOperation = null;
+                if (queued) {
+                    this.runBackgroundIndexOperation(queued);
+                } else {
+                    this.signalIndexReady();
+                }
             }
         })();
     }
@@ -359,6 +405,12 @@ export class LlamaIndexService {
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             ragLogStage('warm', `skipped (${msg})`);
+        }
+    }
+
+    private throwIfIndexBuildCancelled(): void {
+        if (this.indexBuildCancelled) {
+            throw new Error('INDEX_BUILD_CANCELLED');
         }
     }
 
@@ -570,13 +622,129 @@ export class LlamaIndexService {
         return path.join(localStorePath, CODE_GRAPH_MAP_FILENAME);
     }
 
+    private getCodeGraphFileHashesPath(localStorePath: string): string {
+        return path.join(localStorePath, CODE_GRAPH_FILE_HASHES_FILENAME);
+    }
+
+    private getCodeGraphDbPath(localStorePath: string): string {
+        return path.join(localStorePath, CODE_GRAPH_DB);
+    }
+
+    private async ensureCodeGraphSqliteStore(localStorePath: string): Promise<void> {
+        if (this.codeGraphSqliteStore) {
+            return;
+        }
+        try {
+            this.codeGraphSqliteStore = await CodeGraphSqliteStore.open(this.getCodeGraphDbPath(localStorePath));
+        } catch (err) {
+            console.warn('[RAG] Failed to open code_graph.db:', err);
+        }
+    }
+
+    /** Prefer code_graph.db when populated; migrate from JSON sidecar once. */
+    private async bootstrapCodeGraphStore(localStorePath: string): Promise<void> {
+        await this.ensureCodeGraphSqliteStore(localStorePath);
+        if (!this.codeGraphSqliteStore) {
+            return;
+        }
+        try {
+            const entityCount = await this.codeGraphSqliteStore.getEntityCount();
+            if (entityCount > 0) {
+                this.codeGraph = await this.codeGraphSqliteStore.loadGraph();
+                this.symbolNameIndex = buildSymbolNameIndex(this.codeGraph);
+                return;
+            }
+            if (Object.keys(this.codeGraph.nodes).length > 0) {
+                await this.codeGraphSqliteStore.syncFromGraph(this.codeGraph);
+            }
+        } catch (err) {
+            console.warn('[RAG] Code graph SQLite bootstrap failed, using JSON sidecar:', err);
+        }
+    }
+
+    private async syncCodeGraphSqliteFull(): Promise<void> {
+        if (!this.localStorePath) {
+            return;
+        }
+        await this.ensureCodeGraphSqliteStore(this.localStorePath);
+        if (!this.codeGraphSqliteStore) {
+            return;
+        }
+        try {
+            await this.codeGraphSqliteStore.syncFromGraph(this.codeGraph);
+        } catch (err) {
+            console.warn('[RAG] Failed to sync code_graph.db:', err);
+        }
+    }
+
+    private async syncCodeGraphSqliteForFile(filePath: string): Promise<void> {
+        if (!this.localStorePath) {
+            return;
+        }
+        await this.ensureCodeGraphSqliteStore(this.localStorePath);
+        if (!this.codeGraphSqliteStore) {
+            return;
+        }
+        try {
+            await this.codeGraphSqliteStore.syncFileFromGraph(this.codeGraph, filePath);
+        } catch (err) {
+            console.warn(`[RAG] Failed to sync code_graph.db for ${filePath}:`, err);
+        }
+    }
+
+    private invalidateCodeGraphViewCache(): void {
+        this.codeGraphViewPayloadCache = null;
+    }
+
+    private getCodeGraphRevision(): string {
+        return `${Object.keys(this.codeGraph.nodes).length}:${this.codeGraph.edges.length}:${Object.keys(this.codeGraphFileHashes).length}`;
+    }
+
+    private writeSidecarMapsJson(localStorePath: string): void {
+        fs.writeFileSync(this.getDocParentMapPath(localStorePath), JSON.stringify(this.docParentMap, null, 2), 'utf8');
+        fs.writeFileSync(this.getCodeSymbolMapPath(localStorePath), JSON.stringify(this.codeSymbolMap, null, 2), 'utf8');
+        fs.writeFileSync(this.getCodeGraphMapPath(localStorePath), JSON.stringify(this.codeGraph, null, 2), 'utf8');
+        fs.writeFileSync(this.getCodeGraphFileHashesPath(localStorePath), JSON.stringify(this.codeGraphFileHashes, null, 2), 'utf8');
+    }
+
+    /** Write JSON sidecars; optional full SQLite replace (index build end). */
+    private writeSidecarMaps(localStorePath: string, dbSync: 'full' | 'skip' = 'full'): void {
+        this.writeSidecarMapsJson(localStorePath);
+        this.invalidateCodeGraphViewCache();
+        if (dbSync === 'full') {
+            void this.syncCodeGraphSqliteFull();
+        }
+    }
+
+    /** JSON sidecars + per-file SQLite sync (incremental index / graph-only). */
+    private persistSidecarAfterGraphFileUpdate(localStorePath: string, filePath: string): void {
+        this.writeSidecarMapsJson(localStorePath);
+        this.invalidateCodeGraphViewCache();
+        void this.syncCodeGraphSqliteForFile(filePath);
+    }
+
+    private async writeSidecarMapsAsync(localStorePath: string, dbSync: 'full' | 'skip' = 'full'): Promise<void> {
+        await Promise.all([
+            fs.promises.writeFile(this.getDocParentMapPath(localStorePath), JSON.stringify(this.docParentMap, null, 2), 'utf8'),
+            fs.promises.writeFile(this.getCodeSymbolMapPath(localStorePath), JSON.stringify(this.codeSymbolMap, null, 2), 'utf8'),
+            fs.promises.writeFile(this.getCodeGraphMapPath(localStorePath), JSON.stringify(this.codeGraph, null, 2), 'utf8'),
+            fs.promises.writeFile(this.getCodeGraphFileHashesPath(localStorePath), JSON.stringify(this.codeGraphFileHashes, null, 2), 'utf8'),
+        ]);
+        this.invalidateCodeGraphViewCache();
+        if (dbSync === 'full') {
+            await this.syncCodeGraphSqliteFull();
+        }
+    }
+
     private loadSidecarMaps(localStorePath: string): void {
         const parentPath = this.getDocParentMapPath(localStorePath);
         const symbolPath = this.getCodeSymbolMapPath(localStorePath);
         const graphPath = this.getCodeGraphMapPath(localStorePath);
+        const hashesPath = this.getCodeGraphFileHashesPath(localStorePath);
         this.docParentMap = {};
         this.codeSymbolMap = {};
         this.codeGraph = createEmptyCodeGraph();
+        this.codeGraphFileHashes = {};
         this.symbolNameIndex = new Map();
         if (fs.existsSync(parentPath)) {
             try {
@@ -595,31 +763,29 @@ export class LlamaIndexService {
         if (fs.existsSync(graphPath)) {
             try {
                 this.codeGraph = JSON.parse(fs.readFileSync(graphPath, 'utf8')) as CodeGraph;
+                ensureGraphAdjacency(this.codeGraph);
                 this.symbolNameIndex = buildSymbolNameIndex(this.codeGraph);
             } catch (err) {
                 console.warn('[RAG] Failed to load code_graph_map.json:', err);
             }
         }
-    }
-
-    private writeSidecarMaps(localStorePath: string): void {
-        fs.writeFileSync(this.getDocParentMapPath(localStorePath), JSON.stringify(this.docParentMap, null, 2), 'utf8');
-        fs.writeFileSync(this.getCodeSymbolMapPath(localStorePath), JSON.stringify(this.codeSymbolMap, null, 2), 'utf8');
-        fs.writeFileSync(this.getCodeGraphMapPath(localStorePath), JSON.stringify(this.codeGraph, null, 2), 'utf8');
-    }
-
-    private async writeSidecarMapsAsync(localStorePath: string): Promise<void> {
-        await Promise.all([
-            fs.promises.writeFile(this.getDocParentMapPath(localStorePath), JSON.stringify(this.docParentMap, null, 2), 'utf8'),
-            fs.promises.writeFile(this.getCodeSymbolMapPath(localStorePath), JSON.stringify(this.codeSymbolMap, null, 2), 'utf8'),
-            fs.promises.writeFile(this.getCodeGraphMapPath(localStorePath), JSON.stringify(this.codeGraph, null, 2), 'utf8'),
-        ]);
+        if (fs.existsSync(hashesPath)) {
+            try {
+                this.codeGraphFileHashes = JSON.parse(fs.readFileSync(hashesPath, 'utf8')) as Record<string, string>;
+            } catch (err) {
+                console.warn('[RAG] Failed to load code_graph_file_hashes.json:', err);
+            }
+        }
+        void this.bootstrapCodeGraphStore(localStorePath);
     }
 
     private purgeSidecarMapsForFile(normalizedPath: string): void {
         delete this.codeSymbolMap[normalizedPath];
+        delete this.codeGraphFileHashes[normalizedPath];
         purgeFileFromCodeGraph(this.codeGraph, normalizedPath);
         this.symbolNameIndex = buildSymbolNameIndex(this.codeGraph);
+        this.invalidateCodeGraphViewCache();
+        void this.codeGraphSqliteStore?.purgeFile(normalizedPath);
         for (const key of Object.keys(this.docParentMap)) {
             if (key.startsWith(`${normalizedPath}::parent::`)) {
                 delete this.docParentMap[key];
@@ -660,6 +826,7 @@ export class LlamaIndexService {
         this.docParentMap = {};
         this.codeSymbolMap = {};
         this.codeGraph = createEmptyCodeGraph();
+        this.codeGraphFileHashes = {};
         this.symbolNameIndex = new Map();
     }
 
@@ -679,6 +846,7 @@ export class LlamaIndexService {
                     );
                 }
                 await this.closeLocalVectorStore();
+                await this.closeCodeGraphSqliteStore();
                 await this.yieldToEventLoop();
                 await new Promise<void>(resolve => setTimeout(resolve, 250 * (attempt + 1)));
             }
@@ -687,6 +855,7 @@ export class LlamaIndexService {
 
     private async clearLocalStoreAsync(localStorePath: string): Promise<void> {
         await this.closeLocalVectorStore();
+        await this.closeCodeGraphSqliteStore();
         await this.yieldToEventLoop();
         if (fs.existsSync(localStorePath)) {
             await this.removeLocalStoreDirectory(localStorePath);
@@ -694,6 +863,7 @@ export class LlamaIndexService {
         }
         await fs.promises.mkdir(localStorePath, { recursive: true });
         this.resetLocalStoreState();
+        this.invalidateCodeGraphViewCache();
     }
 
     private async clearLocalStoreForFreshBuildAsync(localStorePath: string): Promise<void> {
@@ -731,16 +901,27 @@ export class LlamaIndexService {
 
     private isPathIgnored(filePath: string): boolean {
         const relativePath = path.relative(this.workspaceRoot, filePath).replace(/\\/g, '/');
-        for (const pattern of this.ignorePatterns) {
-            const cleanPattern = pattern.replace(/\\/g, '/');
-            if (minimatch(relativePath, cleanPattern, { dot: true })) {
-                return true;
-            }
-            if (relativePath === cleanPattern || relativePath.startsWith(cleanPattern + '/')) {
-                return true;
-            }
+        return isPathIgnoredByPatterns(relativePath, this.ignorePatterns);
+    }
+
+    private isFileTrackedInIndex(normalizedPath: string): boolean {
+        return (this.fileChunkMap[normalizedPath] ?? 0) > 0
+            || normalizedPath in this.codeSymbolMap
+            || normalizedPath in this.codeGraphFileHashes;
+    }
+
+    private collectIndexedFilePaths(): string[] {
+        const paths = new Set<string>();
+        for (const filePath of Object.keys(this.fileChunkMap)) {
+            paths.add(filePath);
         }
-        return false;
+        for (const filePath of Object.keys(this.codeSymbolMap)) {
+            paths.add(filePath);
+        }
+        for (const filePath of Object.keys(this.codeGraphFileHashes)) {
+            paths.add(filePath);
+        }
+        return [...paths];
     }
 
     private pathInSkippedDir(filePath: string): boolean {
@@ -751,12 +932,29 @@ export class LlamaIndexService {
     private resetIndexFileFailures(): void {
         this.indexFileFailureCount = 0;
         this.indexFileFailureSamples = [];
+        this.consecutiveEmbeddingFailures = 0;
     }
 
     private recordIndexFileFailure(filePath: string, stage: 'read' | 'chunk', err: unknown): void {
         this.indexFileFailureCount += 1;
         this.indexFileFailureSamples.push(`${stage}:${filePath}`);
         console.warn(`[RAG] Failed to ${stage} file ${filePath}:`, err);
+    }
+
+    /** Abort the build when Ollama is dead instead of failing thousands of files one-by-one. */
+    private throwIfFatalEmbeddingError(err: unknown): void {
+        const endpoint = this.currentEmbeddingConfig.ollamaEndpoint;
+        if (isFatalEmbeddingError(err)) {
+            const message = formatUserFacingEmbeddingError(err, endpoint);
+            console.error(`[RAG] Aborting index build: ${message}`);
+            throw new Error(message);
+        }
+        this.consecutiveEmbeddingFailures += 1;
+        if (this.consecutiveEmbeddingFailures >= 5) {
+            const message = formatUserFacingEmbeddingError(err, endpoint);
+            console.error(`[RAG] Aborting index build after ${this.consecutiveEmbeddingFailures} consecutive embedding failures: ${message}`);
+            throw new Error(message);
+        }
     }
 
     private logRetrievedNodes(stage: string, label: string, nodes: RetrievedNode[]): void {
@@ -857,53 +1055,183 @@ export class LlamaIndexService {
         }
     }
 
-    private async purgeIgnoredFilesFromIndex(): Promise<{ removedFiles: number; removedChunks: number }> {
-        if (!this.localVectorStore && !this.milvusStore) {
+    private async purgeIneligibleFilesFromIndex(): Promise<{ removedFiles: number; removedChunks: number }> {
+        if (this.collectIndexedFilePaths().length === 0) {
             return { removedFiles: 0, removedChunks: 0 };
         }
 
         let removedFiles = 0;
         let removedChunks = 0;
-        for (const filePath of Object.keys(this.fileChunkMap)) {
-            if (!this.isPathIgnored(filePath)) {
+        for (const filePath of this.collectIndexedFilePaths()) {
+            if (this.shouldIndexFile(filePath)) {
                 continue;
             }
             const removed = await this.removeFileFromAllIndexes(filePath);
-            removedChunks += removed;
             removedFiles += 1;
+            removedChunks += removed;
         }
 
         if (removedFiles > 0) {
-            console.log(`[RAG] Purged ${removedFiles} ignored file(s), ${removedChunks} chunk(s) removed`);
+            console.log(`[RAG] Purged ${removedFiles} ineligible file(s), ${removedChunks} chunk(s) removed`);
         }
         return { removedFiles, removedChunks };
     }
 
+    private async reconcileIndexWithWorkspaceRules(options?: { addMissing?: boolean }): Promise<{
+        removedFiles: number;
+        removedChunks: number;
+        addedFiles: number;
+        addedChunks: number;
+    }> {
+        const result = { removedFiles: 0, removedChunks: 0, addedFiles: 0, addedChunks: 0 };
+        const purge = await this.purgeIneligibleFilesFromIndex();
+        result.removedFiles = purge.removedFiles;
+        result.removedChunks = purge.removedChunks;
+
+        if (options?.addMissing === false) {
+            return result;
+        }
+
+        const graphOnly = this.activeIndexType === 'milvus' && !this.localVectorStore;
+        const canEmbed = Boolean(this.cachedManifestParams && (this.localVectorStore || this.milvusStore));
+        if (!canEmbed && !graphOnly) {
+            return result;
+        }
+
+        const targetFiles = await this.collectTargetFilesAsync();
+        const mdParser = this.createMdParser();
+        for (let i = 0; i < targetFiles.length; i++) {
+            if (i % INDEX_YIELD_EVERY === 0) {
+                await this.yieldToEventLoop();
+            }
+            const filePath = targetFiles[i];
+            const normalized = this.normalizeFilePath(filePath);
+            if (!this.shouldIndexFile(normalized) || this.isFileTrackedInIndex(normalized)) {
+                continue;
+            }
+            try {
+                if (canEmbed) {
+                    const newChunks = await this.upsertFileInAllIndexes(filePath);
+                    if (newChunks > 0) {
+                        result.addedFiles += 1;
+                        result.addedChunks += newChunks;
+                    }
+                } else {
+                    const updated = await this.refreshGraphForSingleFile(filePath, mdParser);
+                    if (updated) {
+                        result.addedFiles += 1;
+                    }
+                }
+            } catch (err) {
+                console.warn(`[RAG] Failed to index newly eligible file ${filePath}:`, err);
+            }
+        }
+
+        if (result.addedFiles > 0) {
+            console.log(`[RAG] Indexed ${result.addedFiles} newly eligible file(s), ${result.addedChunks} chunk(s) added`);
+        }
+        return result;
+    }
+
+    private async persistReconcileResult(reconcile: {
+        removedFiles: number;
+        removedChunks: number;
+        addedFiles: number;
+        addedChunks: number;
+    }): Promise<void> {
+        if (!this.localStorePath) {
+            return;
+        }
+        if (reconcile.removedFiles === 0 && reconcile.addedFiles === 0) {
+            return;
+        }
+
+        let manifest = this.readManifest(this.localStorePath);
+        if (!manifest) {
+            return;
+        }
+
+        manifest = {
+            ...manifest,
+            fileCount: Math.max(0, manifest.fileCount - reconcile.removedFiles + reconcile.addedFiles),
+            chunkCount: Math.max(0, manifest.chunkCount - reconcile.removedChunks + reconcile.addedChunks),
+            builtAt: new Date().toISOString(),
+        };
+        this.writeManifest(this.localStorePath, manifest);
+        await this.writeFileChunkMapAsync(this.localStorePath);
+        await this.writeSidecarMapsAsync(this.localStorePath, 'skip');
+        console.log(
+            `[RAG] Reconciled index with workspace rules: -${reconcile.removedFiles}/+${reconcile.addedFiles} files, Δchunks=${reconcile.addedChunks - reconcile.removedChunks}`,
+        );
+    }
+
+    private async pruneStaleIndexedFilesFromBuild(
+        indexedFiles: Set<string>,
+        targetFiles: string[],
+    ): Promise<{ removedFiles: number; removedChunks: number }> {
+        const targetSet = new Set(targetFiles.map(filePath => this.normalizeFilePath(filePath)));
+        const toCheck = new Set<string>([...indexedFiles, ...this.collectIndexedFilePaths()]);
+        let removedFiles = 0;
+        let removedChunks = 0;
+
+        for (const filePath of toCheck) {
+            if (targetSet.has(filePath) && this.shouldIndexFile(filePath)) {
+                continue;
+            }
+            if (!this.isFileTrackedInIndex(filePath)) {
+                indexedFiles.delete(filePath);
+                continue;
+            }
+            const removed = await this.removeFileFromAllIndexes(filePath);
+            removedFiles += 1;
+            removedChunks += removed;
+            indexedFiles.delete(filePath);
+        }
+
+        if (removedFiles > 0) {
+            console.log(
+                `[RAG] Pruned ${removedFiles} stale indexed file(s) outside current target (${targetFiles.length} files), ${removedChunks} chunk(s) removed`,
+            );
+        }
+        return { removedFiles, removedChunks };
+    }
+
+    private async reconcileIndexAfterLoad(addMissing = false): Promise<void> {
+        if (!this.localStorePath || !this.readManifest(this.localStorePath)) {
+            return;
+        }
+
+        const reconcile = await this.reconcileIndexWithWorkspaceRules({ addMissing });
+        await this.persistReconcileResult(reconcile);
+    }
+
     private async removeFileFromAllIndexes(filePath: string): Promise<number> {
         const normalized = this.normalizeFilePath(filePath);
-        const chunkCount = this.fileChunkMap[normalized] ?? 0;
-        if (chunkCount === 0) {
+        if (!this.isFileTrackedInIndex(normalized)) {
             return 0;
         }
+        const chunkCount = this.fileChunkMap[normalized] ?? 0;
 
-        if (this.milvusStore && this.activeIndexType === 'milvus') {
-            const chunkIds: string[] = [];
-            for (let i = 0; i < chunkCount; i++) {
-                chunkIds.push(getChunkDocId(normalized, i));
+        if (chunkCount > 0) {
+            if (this.milvusStore && this.activeIndexType === 'milvus') {
+                const chunkIds: string[] = [];
+                for (let i = 0; i < chunkCount; i++) {
+                    chunkIds.push(getChunkDocId(normalized, i));
+                }
+                await this.milvusStore.deleteByChunkIds(chunkIds);
             }
-            await this.milvusStore.deleteByChunkIds(chunkIds);
-        }
 
-        if (this.localVectorStore) {
-            const chunkIds: string[] = [];
-            for (let i = 0; i < chunkCount; i++) {
-                chunkIds.push(getChunkDocId(normalized, i));
-            }
-            await this.localVectorStore.deleteByChunkIds(chunkIds);
-            try {
-                await this.localVectorStore.deleteByChunkIds([normalized]);
-            } catch {
-                // ignore legacy id
+            if (this.localVectorStore) {
+                const chunkIds: string[] = [];
+                for (let i = 0; i < chunkCount; i++) {
+                    chunkIds.push(getChunkDocId(normalized, i));
+                }
+                await this.localVectorStore.deleteByChunkIds(chunkIds);
+                try {
+                    await this.localVectorStore.deleteByChunkIds([normalized]);
+                } catch {
+                    // ignore legacy id
+                }
             }
         }
 
@@ -920,6 +1248,12 @@ export class LlamaIndexService {
         if (!symbols?.length) {
             return Promise.resolve();
         }
+        const hash = computeFileContentHash(content);
+        if (this.codeGraphFileHashes[normalizedPath] === hash) {
+            return Promise.resolve();
+        }
+        purgeFileFromCodeGraph(this.codeGraph, normalizedPath);
+        this.symbolNameIndex = buildSymbolNameIndex(this.codeGraph);
         return mergeFileIntoCodeGraphAsync(
             this.codeGraph,
             normalizedPath,
@@ -927,7 +1261,10 @@ export class LlamaIndexService {
             symbols,
             this.workspaceRoot,
             this.symbolNameIndex,
-        );
+        ).then(() => {
+            this.codeGraphFileHashes[normalizedPath] = hash;
+            this.symbolNameIndex = buildSymbolNameIndex(this.codeGraph);
+        });
     }
 
     private async completeRagLlmPrompt(prompt: string): Promise<string> {
@@ -1080,7 +1417,7 @@ export class LlamaIndexService {
         this.fileChunkMap[normalized] = nodes.length;
         await this.updateCodeGraphSafely(normalized, content);
         if (this.localStorePath) {
-            this.writeSidecarMaps(this.localStorePath);
+            this.persistSidecarAfterGraphFileUpdate(this.localStorePath, normalized);
         }
         return nodes.length;
     }
@@ -1358,6 +1695,8 @@ export class LlamaIndexService {
     /** Pre-orchestrator retrieval path (no router / graph / sub-questions). */
     private async assembleLegacyContext(queryText: string, opts: Required<RagQueryOptions>): Promise<string | null> {
         ragLogStage('legacy', 'path=legacy (no orchestrator stages)');
+        let scored: RetrievedNode[] = [];
+
         if (this.activeIndexType === 'milvus' && this.milvusStore) {
             const denseVector = await Settings.embedModel.getTextEmbedding(queryText);
             this.logEmbedQuery(queryText, denseVector);
@@ -1367,64 +1706,54 @@ export class LlamaIndexService {
                 opts.useReranker ? opts.similarityTopK : opts.finalTopK,
             );
             ragLogStage('retrieve', `milvus hits=${hits.length}`);
-            if (hits.length === 0) {
-                return null;
+            if (hits.length > 0) {
+                scored = await Promise.all(hits.map(async (hit, index) => ({
+                    node: await this.nodeFromMilvusHit(hit),
+                    score: typeof hit.score === 'number' ? hit.score : (hits.length - index),
+                })));
+                this.logRetrievedNodes('retrieve', 'nodes', scored);
+                if (opts.useReranker && scored.length > 1) {
+                    const rerankPool = Math.max(opts.finalTopK * 2, opts.finalTopK);
+                    const before = scored.length;
+                    scored = rerankRetrievedNodes(queryText, scored, rerankPool);
+                    ragLogStage('rerank', `${before} -> ${scored.length}`);
+                }
+                scored = applyMMRDiversity(scored, opts.finalTopK);
+                ragLogStage('mmr', `finalTopK=${opts.finalTopK} nodes=${scored.length}`);
             }
-            let scored: RetrievedNode[] = await Promise.all(hits.map(async (hit, index) => ({
-                node: await this.nodeFromMilvusHit(hit),
-                score: typeof hit.score === 'number' ? hit.score : (hits.length - index),
-            })));
-            this.logRetrievedNodes('retrieve', 'nodes', scored);
-            if (opts.useReranker && scored.length > 1) {
-                const rerankPool = Math.max(opts.finalTopK * 2, opts.finalTopK);
-                const before = scored.length;
-                scored = rerankRetrievedNodes(queryText, scored, rerankPool);
-                ragLogStage('rerank', `${before} -> ${scored.length}`);
-            }
-            scored = applyMMRDiversity(scored, opts.finalTopK);
-            ragLogStage('mmr', `finalTopK=${opts.finalTopK} nodes=${scored.length}`);
-            const formatted = await Promise.all(
-                scored.map(async result => {
-                    const displayContent = await this.resolveDisplayContent(result.node);
-                    return this.formatNodeContext(result.node, displayContent);
-                }),
-            );
-            const result = formatted.join('\n\n');
-            ragLogBody('assemble', 'legacy vectorContext', result);
-            return result;
-        }
+        } else if (this.localVectorStore) {
+            const denseVector = await Settings.embedModel.getTextEmbedding(queryText);
+            this.logEmbedQuery(queryText, denseVector);
+            const topK = opts.useReranker ? opts.similarityTopK : opts.finalTopK;
+            const hits = await this.localVectorStore.similaritySearch(denseVector, {
+                topK,
+                onBatchScanned: () => this.yieldToEventLoop(),
+            });
+            ragLogStage('retrieve', `local hits=${hits.length} topK=${topK}`);
+            if (hits.length > 0) {
+                scored = hits.map((hit) => ({
+                    node: localVectorRecordToNode(hit.record),
+                    score: hit.score,
+                }));
+                this.logRetrievedNodes('retrieve', 'nodes', scored);
 
-        if (!this.localVectorStore) {
+                if (opts.useReranker && scored.length > 1) {
+                    const rerankPool = Math.max(opts.finalTopK * 2, opts.finalTopK);
+                    const before = scored.length;
+                    scored = rerankRetrievedNodes(queryText, scored, rerankPool);
+                    ragLogStage('rerank', `${before} -> ${scored.length}`);
+                }
+                scored = applyMMRDiversity(scored, opts.finalTopK);
+                ragLogStage('mmr', `finalTopK=${opts.finalTopK} nodes=${scored.length}`);
+            }
+        } else {
             ragLogStage('legacy', 'no local vector store');
             return null;
         }
 
-        const denseVector = await Settings.embedModel.getTextEmbedding(queryText);
-        this.logEmbedQuery(queryText, denseVector);
-        const topK = opts.useReranker ? opts.similarityTopK : opts.finalTopK;
-        const hits = await this.localVectorStore.similaritySearch(denseVector, {
-            topK,
-            onBatchScanned: () => this.yieldToEventLoop(),
-        });
-        ragLogStage('retrieve', `local hits=${hits.length} topK=${topK}`);
-        if (hits.length === 0) {
+        if (scored.length === 0) {
             return null;
         }
-
-        let scored: RetrievedNode[] = hits.map((hit) => ({
-            node: localVectorRecordToNode(hit.record),
-            score: hit.score,
-        }));
-        this.logRetrievedNodes('retrieve', 'nodes', scored);
-
-        if (opts.useReranker && scored.length > 1) {
-            const rerankPool = Math.max(opts.finalTopK * 2, opts.finalTopK);
-            const before = scored.length;
-            scored = rerankRetrievedNodes(queryText, scored, rerankPool);
-            ragLogStage('rerank', `${before} -> ${scored.length}`);
-        }
-        scored = applyMMRDiversity(scored, opts.finalTopK);
-        ragLogStage('mmr', `finalTopK=${opts.finalTopK} nodes=${scored.length}`);
 
         const formatted = await Promise.all(
             scored.map(async result => {
@@ -1432,7 +1761,27 @@ export class LlamaIndexService {
                 return this.formatNodeContext(result.node, displayContent);
             }),
         );
-        const result = formatted.join('\n\n');
+        const topKBlock = formatted.join('\n\n');
+
+        let result = topKBlock;
+        if (opts.useGraphExpand) {
+            console.log(`[RAG] assembleLegacyContext: starting graph expansion with ${scored.length} nodes, hops=${opts.graphExpandHops}, max=${opts.graphExpandMax}`);
+            const graphSnippets = await expandRetrievalWithGraph(
+                this.codeGraph,
+                scored,
+                (filePath, startLine, endLine) => this.readFileLineRange(filePath, startLine, endLine),
+                opts.graphExpandMax,
+                opts.graphExpandHops,
+            );
+            console.log(`[RAG] assembleLegacyContext: graph expansion completed. Found ${graphSnippets.length} snippets.`);
+            ragLogStage('legacy-graph', `snippets=${graphSnippets.length} hops=${opts.graphExpandHops} max=${opts.graphExpandMax}`);
+            if (graphSnippets.length > 0) {
+                const graphBlock = graphSnippets.map(formatGraphExpandedSnippet).join('\n\n');
+                ragLogBody('legacy-graph', 'block', graphBlock);
+                result = `${topKBlock}\n\n${graphBlock}`;
+            }
+        }
+
         ragLogBody('assemble', 'legacy vectorContext', result);
         return result;
     }
@@ -1459,8 +1808,12 @@ export class LlamaIndexService {
         return true;
     }
 
+    private sortWalkEntries(parentDir: string, entries: string[]): string[] {
+        return entries.slice().sort((a, b) => compareWalkDirectoryNames(a, b, parentDir, this.workspaceRoot));
+    }
+
     private walkDir(dir: string, fileList: string[] = []): string[] {
-        const files = fs.readdirSync(dir);
+        const files = this.sortWalkEntries(dir, fs.readdirSync(dir));
         for (const file of files) {
             const filePath = path.join(dir, file);
             if (this.isPathIgnored(filePath)) {
@@ -1482,7 +1835,7 @@ export class LlamaIndexService {
     private async walkDirAsync(dir: string, fileList: string[] = [], visited = { count: 0 }): Promise<string[]> {
         let entries: string[];
         try {
-            entries = await fs.promises.readdir(dir);
+            entries = this.sortWalkEntries(dir, await fs.promises.readdir(dir));
         } catch {
             return fileList;
         }
@@ -1527,9 +1880,9 @@ export class LlamaIndexService {
                 }
             }
             console.log(`[RAG] Indexing ${files.length} files from compile_commands.json whitelist`);
-            return files;
+            return sortFilesForIndexing(files, this.workspaceRoot);
         }
-        return this.walkDir(this.workspaceRoot);
+        return sortFilesForIndexing(this.walkDir(this.workspaceRoot), this.workspaceRoot);
     }
 
     private async collectTargetFilesAsync(): Promise<string[]> {
@@ -1561,11 +1914,12 @@ export class LlamaIndexService {
                 }
             }
             console.log(`[RAG] Indexing ${files.length} files from compile_commands.json whitelist`);
-            return files;
+            return sortFilesForIndexing(files, this.workspaceRoot);
         }
 
-        const files = await this.walkDirAsync(this.workspaceRoot);
-        console.log(`[RAG] Discovered ${files.length} indexable files in workspace`);
+        const files = sortFilesForIndexing(await this.walkDirAsync(this.workspaceRoot), this.workspaceRoot);
+        const srcCount = files.filter(f => getIndexFilePriority(f, this.workspaceRoot) === 0).length;
+        console.log(`[RAG] Discovered ${files.length} indexable files in workspace (${srcCount} under src/ first)`);
         return files;
     }
 
@@ -1674,10 +2028,12 @@ export class LlamaIndexService {
 
     private async detectEmbeddingDimensions(): Promise<{ dimensions: number; isOnline: boolean }> {
         const provider = this.currentEmbeddingConfig.provider ?? DEFAULT_RAG_EMBEDDING.provider;
+        const endpoint = this.currentEmbeddingConfig.ollamaEndpoint ?? DEFAULT_RAG_EMBEDDING.ollamaEndpoint;
         let dimensions = provider === 'ollama'
             ? OLLAMA_EMBEDDING_DEFAULT_DIMENSIONS
             : OPENAI_EMBEDDING_DEFAULT_DIMENSIONS;
         let isOnline = true;
+        this.lastEmbeddingProbeError = null;
         try {
             const dummyVector = await Settings.embedModel.getTextEmbedding("test");
             if (dummyVector && dummyVector.length > 0) {
@@ -1686,7 +2042,11 @@ export class LlamaIndexService {
             }
         } catch (err) {
             isOnline = false;
-            console.warn(`[RAG] Failed to dynamically detect embedding dimensions, using default: ${dimensions}`, err);
+            this.lastEmbeddingProbeError = getEmbeddingErrorText(err);
+            console.warn(
+                `[RAG] Embedding probe failed (${endpoint}): ${formatUserFacingEmbeddingError(err, endpoint)}`,
+                err,
+            );
         }
         return { dimensions, isOnline };
     }
@@ -1694,9 +2054,17 @@ export class LlamaIndexService {
     private async embedNodesInBatches(nodes: BaseNode[]): Promise<void> {
         for (let i = 0; i < nodes.length; i += EMBED_BATCH_SIZE) {
             await this.yieldToEventLoop();
+            this.throwIfIndexBuildCancelled();
             const batch = nodes.slice(i, i + EMBED_BATCH_SIZE);
             const texts = batch.map(node => node.getContent(MetadataMode.NONE));
-            const embeddings = await Settings.embedModel.getTextEmbeddings(texts);
+            let embeddings: number[][];
+            try {
+                embeddings = await Settings.embedModel.getTextEmbeddings(texts);
+            } catch (err) {
+                this.throwIfFatalEmbeddingError(err);
+                throw err;
+            }
+            this.consecutiveEmbeddingFailures = 0;
             batch.forEach((node, index) => {
                 node.embedding = embeddings[index];
             });
@@ -1777,6 +2145,7 @@ export class LlamaIndexService {
         const fileChunkMap: Record<string, number> = {};
         this.resetIndexFileFailures();
         this.codeGraph = createEmptyCodeGraph();
+        this.codeGraphFileHashes = {};
         this.symbolNameIndex = new Map();
 
         this.fireProgress({
@@ -2099,18 +2468,10 @@ export class LlamaIndexService {
         }
 
         const targetFiles = await this.collectTargetFilesAsync();
+        const pruned = await this.pruneStaleIndexedFilesFromBuild(indexedFiles, targetFiles);
+        totalChunks = Math.max(0, totalChunks - pruned.removedChunks);
+
         const pendingFiles = targetFiles.filter(filePath => !indexedFiles.has(this.normalizeFilePath(filePath)));
-        pendingFiles.sort((a, b) => {
-            const aIsSrc = a.split(/[\\/]/).some(s => s.toLowerCase() === 'src');
-            const bIsSrc = b.split(/[\\/]/).some(s => s.toLowerCase() === 'src');
-            if (aIsSrc && !bIsSrc) {
-                return -1;
-            }
-            if (!aIsSrc && bIsSrc) {
-                return 1;
-            }
-            return 0;
-        });
 
         this.localIndexBuildDeferHnsw = !resume || indexedFiles.size === 0;
         this.resetIndexFileFailures();
@@ -2150,6 +2511,7 @@ export class LlamaIndexService {
         for (let i = 0; i < pendingFiles.length; i++) {
             if (i % BUILD_FILE_YIELD_EVERY === 0) {
                 await this.yieldToEventLoop();
+                this.throwIfIndexBuildCancelled();
             }
 
             const filePath = pendingFiles[i];
@@ -2158,6 +2520,9 @@ export class LlamaIndexService {
             try {
                 totalChunks += await this.indexSingleFileForLocalBuild(filePath, mdParser, dimensions);
             } catch (e) {
+                if (isFatalEmbeddingError(e)) {
+                    this.throwIfFatalEmbeddingError(e);
+                }
                 this.recordIndexFileFailure(filePath, 'chunk', e);
             }
 
@@ -2327,6 +2692,7 @@ export class LlamaIndexService {
             this.docParentMap = {};
             this.codeSymbolMap = {};
             this.codeGraph = createEmptyCodeGraph();
+            this.codeGraphFileHashes = {};
             this.symbolNameIndex = new Map();
         }
 
@@ -2483,7 +2849,7 @@ export class LlamaIndexService {
             milvusConfig,
             embeddingConfig,
             initOptions,
-        ));
+        ), { replace: initOptions?.forceRebuild === true });
         return targetType;
     }
 
@@ -2517,7 +2883,7 @@ export class LlamaIndexService {
             if (storeLayout.isLegacy) {
                 console.log('[RAG] Using legacy hash-based index store. Rebuild to migrate to project-named storage.');
             }
-            const checkpoint = this.readBuildCheckpoint(localStorePath);
+            let checkpoint = this.readBuildCheckpoint(localStorePath);
 
             if (useMilvus) {
                 if (!milvusConfig?.address?.trim()) {
@@ -2570,16 +2936,25 @@ export class LlamaIndexService {
             const manifestCompatible = manifest
                 ? this.manifestMatches(manifest, provider!, model!, dimensions, expectedBackend)
                 : false;
-            const checkpointCompatible = checkpoint
-                ? this.checkpointMatches(checkpoint, provider!, model!, dimensions, expectedBackend)
-                : false;
             const hasCompleteIndex = useMilvus
                 ? Boolean(manifest && manifestCompatible && (manifest.indexBackend === 'milvus' || manifest.indexBackend === 'dual'))
                 : this.localStoreHasIndex(storeLayout) && Boolean(manifest) && manifestCompatible;
+
+            if (hasCompleteIndex && checkpoint) {
+                console.log('[RAG] Clearing stale build checkpoint; using completed index with reconcile.');
+                this.deleteBuildCheckpoint(localStorePath);
+                checkpoint = null;
+            }
+
+            const checkpointCompatible = checkpoint
+                ? this.checkpointMatches(checkpoint, provider!, model!, dimensions, expectedBackend)
+                : false;
             const canResumeBuild = !forceRebuild
                 && !useMilvus
                 && checkpointCompatible
-                && this.localStoreHasIndex(storeLayout);
+                && this.localStoreHasIndex(storeLayout)
+                && checkpoint !== null
+                && checkpoint.indexedFiles.length < checkpoint.totalFiles;
 
             const shouldRebuild = forceRebuild
                 || canResumeBuild
@@ -2597,19 +2972,23 @@ export class LlamaIndexService {
                             await this.loadLocalVectorStore(localStorePath, dimensions);
                             this.activeIndexType = this.localVectorStore ? 'local' : null;
                         }
-                        if (manifest) {
+                        await this.reconcileIndexAfterLoad(false);
+                        const reconciledManifest = this.readManifest(localStorePath) ?? manifest;
+                        if (reconciledManifest) {
                             this.fireComplete({
-                                fileCount: manifest.fileCount,
-                                chunkCount: manifest.chunkCount,
-                                builtAt: manifest.builtAt,
+                                fileCount: reconciledManifest.fileCount,
+                                chunkCount: reconciledManifest.chunkCount,
+                                builtAt: reconciledManifest.builtAt,
                                 indexType: useMilvus ? 'milvus' : 'local',
                             });
                         }
                     } else {
                         this.activeIndexType = null;
-                        this.fireError(
-                            'Cannot build index: embedding model is offline. Start Ollama and use an embedding model (e.g. nomic-embed-text, bge-m3).',
-                        );
+                        const endpoint = this.currentEmbeddingConfig.ollamaEndpoint ?? DEFAULT_RAG_EMBEDDING.ollamaEndpoint;
+                        const message = this.lastEmbeddingProbeError
+                            ? formatUserFacingEmbeddingError(this.lastEmbeddingProbeError, endpoint)
+                            : 'Cannot build index: embedding model is offline. Start Ollama and use an embedding model (e.g. nomic-embed-text, bge-m3).';
+                        this.fireError(message);
                     }
                     return;
                 }
@@ -2641,6 +3020,7 @@ export class LlamaIndexService {
             this.fireProgress({ phase: 'loading', filesDone: 0, filesTotal: 0, chunks: 0 });
             if (useMilvus) {
                 await this.loadMilvusIndex(localStorePath, workspaceHash, dimensions);
+                await this.reconcileIndexAfterLoad(isOnline);
                 const loadedManifest = this.readManifest(localStorePath);
                 if (loadedManifest) {
                     this.fireComplete({
@@ -2658,11 +3038,13 @@ export class LlamaIndexService {
 
             const loadedManifest = this.readManifest(localStorePath);
             await this.loadLocalVectorStore(localStorePath, loadedManifest?.dimensions ?? dimensions);
-            if (loadedManifest) {
+            await this.reconcileIndexAfterLoad(isOnline);
+            const reconciledManifest = this.readManifest(localStorePath) ?? loadedManifest;
+            if (reconciledManifest) {
                 this.fireComplete({
-                    fileCount: loadedManifest.fileCount,
-                    chunkCount: loadedManifest.chunkCount,
-                    builtAt: loadedManifest.builtAt,
+                    fileCount: reconciledManifest.fileCount,
+                    chunkCount: reconciledManifest.chunkCount,
+                    builtAt: reconciledManifest.builtAt,
                     indexType: 'local',
                 });
             } else {
@@ -2673,6 +3055,116 @@ export class LlamaIndexService {
             const message = err instanceof Error ? err.message : String(err);
             this.fireError(message);
         }
+    }
+
+    /**
+     * Graph-only incremental path for Milvus-primary index (no local vector store).
+     */
+    private async applyGraphOnlyIncrementalChanges(merged: Map<string, RagFileChange['type']>): Promise<void> {
+        if (!this.localStorePath) {
+            return;
+        }
+
+        let manifest = this.readManifest(this.localStorePath);
+        if (!manifest) {
+            return;
+        }
+
+        const mdParser = this.createMdParser();
+        let appliedCount = 0;
+
+        const ignoreRulesChanged = [...merged.keys()].some(filePath => {
+            const baseName = path.basename(filePath);
+            return baseName === '.mcodeignore' || baseName === '.voidignore';
+        });
+        if (ignoreRulesChanged) {
+            this.loadMcodeIgnore(this.workspaceRoot);
+            const reconcile = await this.reconcileIndexWithWorkspaceRules({ addMissing: true });
+            await this.persistReconcileResult(reconcile);
+            manifest = this.readManifest(this.localStorePath) ?? manifest;
+            appliedCount += reconcile.removedFiles + reconcile.addedFiles;
+        }
+
+        for (const [filePath, changeType] of merged) {
+            const baseName = path.basename(filePath);
+            if (baseName === '.mcodeignore' || baseName === '.voidignore') {
+                continue;
+            }
+
+            const wasInGraph = filePath in this.codeSymbolMap || filePath in this.codeGraphFileHashes;
+
+            if (changeType === 'deleted') {
+                if (wasInGraph) {
+                    this.purgeSidecarMapsForFile(filePath);
+                    appliedCount += 1;
+                }
+                continue;
+            }
+
+            if (!this.shouldIndexFile(filePath)) {
+                if (wasInGraph) {
+                    this.purgeSidecarMapsForFile(filePath);
+                    appliedCount += 1;
+                }
+                continue;
+            }
+
+            try {
+                const updated = await this.refreshGraphForSingleFile(filePath, mdParser);
+                if (updated) {
+                    appliedCount += 1;
+                }
+            } catch (err) {
+                console.warn(`[RAG] Graph-only incremental failed for ${filePath}:`, err);
+            }
+        }
+
+        if (appliedCount === 0) {
+            this.currentPhase = 'idle';
+            this.filesDone = 0;
+            this.filesTotal = 0;
+            this.currentFile = null;
+            return;
+        }
+
+        manifest = {
+            ...manifest,
+            builtAt: new Date().toISOString(),
+        };
+        this.writeManifest(this.localStorePath, manifest);
+        this.writeSidecarMapsJson(this.localStorePath);
+        console.log(`[RAG] Graph-only incremental: ${appliedCount} file(s)`);
+
+        this.lastIncrementalSync = {
+            fileCount: appliedCount,
+            deltaChunks: 0,
+            timestamp: new Date().toISOString(),
+        };
+        this._onIncrementalSync.fire(this.lastIncrementalSync);
+        this.fireComplete({
+            fileCount: manifest.fileCount,
+            chunkCount: manifest.chunkCount,
+            builtAt: manifest.builtAt,
+            indexType: 'milvus',
+        });
+    }
+
+    /** Re-chunk symbols and merge graph for one file (no vector embed). */
+    private async refreshGraphForSingleFile(filePath: string, mdParser: MarkdownNodeParser): Promise<boolean> {
+        const normalized = this.normalizeFilePath(filePath);
+        if (!fs.existsSync(normalized)) {
+            return false;
+        }
+        const content = await this.readFileIfIndexable(normalized);
+        if (content === null) {
+            return false;
+        }
+        await this.chunkFile(normalized, content, mdParser);
+        await this.updateCodeGraphSafely(normalized, content);
+        if (this.localStorePath) {
+            this.persistSidecarAfterGraphFileUpdate(this.localStorePath, normalized);
+        }
+        return true;
     }
 
     /**
@@ -2691,7 +3183,11 @@ export class LlamaIndexService {
         }
 
         let manifest = this.readManifest(this.localStorePath);
-        if (!manifest || !this.cachedManifestParams) {
+        if (!manifest) {
+            return;
+        }
+        const graphOnlyEarly = milvusPrimary && !this.localVectorStore;
+        if (!graphOnlyEarly && !this.cachedManifestParams) {
             return;
         }
 
@@ -2719,27 +3215,39 @@ export class LlamaIndexService {
         // compile_commands.json changed → whitelist changed, full rebuild (includes git commit re-index)
         for (const filePath of merged.keys()) {
             if (path.basename(filePath) === 'compile_commands.json') {
+                const cachedParams = this.cachedManifestParams;
+                if (!cachedParams) {
+                    console.warn('[RAG] compile_commands.json changed but manifest params missing; skipping rebuild.');
+                    return;
+                }
                 console.log('[RAG] compile_commands.json changed, triggering full index rebuild (code whitelist + git commits).');
                 if (milvusPrimary) {
                     await this.buildMilvusIndex(
                         this.localStorePath,
                         this.workspaceHash,
-                        this.cachedManifestParams.provider,
-                        this.cachedManifestParams.model,
-                        this.cachedManifestParams.dimensions,
+                        cachedParams.provider,
+                        cachedParams.model,
+                        cachedParams.dimensions,
                         manifest.indexBackend === 'dual',
                     );
                 } else {
                     await this.buildLocalIndex(
                         this.localStorePath,
-                        this.cachedManifestParams.provider,
-                        this.cachedManifestParams.model,
-                        this.cachedManifestParams.dimensions,
+                        cachedParams.provider,
+                        cachedParams.model,
+                        cachedParams.dimensions,
                         { forceFresh: true },
                     );
                 }
                 return;
             }
+        }
+
+        // Milvus-only: refresh code graph sidecars without re-embedding vectors.
+        const graphOnly = milvusPrimary && !this.localVectorStore;
+        if (graphOnly) {
+            await this.applyGraphOnlyIncrementalChanges(merged);
+            return;
         }
 
         let netChunkDelta = 0;
@@ -2752,10 +3260,10 @@ export class LlamaIndexService {
         });
         if (ignoreRulesChanged) {
             this.loadMcodeIgnore(this.workspaceRoot);
-            const purge = await this.purgeIgnoredFilesFromIndex();
-            netChunkDelta -= purge.removedChunks;
-            netFileDelta -= purge.removedFiles;
-            appliedCount += purge.removedFiles;
+            const reconcile = await this.reconcileIndexWithWorkspaceRules({ addMissing: true });
+            netChunkDelta += reconcile.addedChunks - reconcile.removedChunks;
+            netFileDelta += reconcile.addedFiles - reconcile.removedFiles;
+            appliedCount += reconcile.removedFiles + reconcile.addedFiles;
         }
 
         for (const [filePath, changeType] of merged) {
@@ -2764,7 +3272,8 @@ export class LlamaIndexService {
                 continue;
             }
 
-            const wasIndexed = filePath in this.fileChunkMap;
+            const normalizedPath = this.normalizeFilePath(filePath);
+            const wasIndexed = this.isFileTrackedInIndex(normalizedPath);
 
             if (changeType === 'deleted') {
                 if (wasIndexed) {
@@ -2821,7 +3330,7 @@ export class LlamaIndexService {
 
         this.writeManifest(this.localStorePath, manifest);
         this.writeFileChunkMap(this.localStorePath);
-        this.writeSidecarMaps(this.localStorePath);
+        this.writeSidecarMaps(this.localStorePath, 'skip');
         console.log(`[RAG] Incremental update: ${appliedCount} file(s), Δchunks=${netChunkDelta}, Δfiles=${netFileDelta}`);
 
         this.lastIncrementalSync = {
@@ -2922,5 +3431,122 @@ export class LlamaIndexService {
             kind: dep.kind,
             reason: dep.reason,
         }));
+    }
+
+    public getCodeGraph(): CodeGraph {
+        return this.codeGraph;
+    }
+
+    public getCodeGraphViewPayload(options?: CodeGraphViewOptions): CodeGraphViewPayload {
+        ensureGraphAdjacency(this.codeGraph);
+        const revision = this.getCodeGraphRevision();
+        const hasOptions = !!(options?.displayScope || options?.focusFilePath || options?.pendingSearchQuery);
+        if (!hasOptions && this.codeGraphViewPayloadCache?.revision === revision) {
+            return this.codeGraphViewPayloadCache.payload;
+        }
+        const payload = buildCodeGraphViewPayload(this.codeGraph, 8, options);
+        if (!hasOptions) {
+            this.codeGraphViewPayloadCache = { revision, payload };
+        }
+        return payload;
+    }
+
+    /**
+     * Build [REPOSITORY MAP] blocks from indexed codeSymbolMap + 1-hop code graph neighbors.
+     * Files without index entries are listed in missingPaths for live-model fallback.
+     */
+    public getRepositoryMapFromIndex(filePaths: string[], maxGraphNeighbors = 4): RepositoryMapIndexResult {
+        const blocks: string[] = [];
+        const missingPaths: string[] = [];
+        const missingSet = new Set<string>();
+
+        for (const rawPath of filePaths) {
+            const normalized = this.normalizeFilePath(rawPath);
+            const symbols = this.codeSymbolMap[normalized];
+            if (!symbols?.length) {
+                if (!missingSet.has(normalized)) {
+                    missingSet.add(normalized);
+                    missingPaths.push(rawPath);
+                }
+                continue;
+            }
+            const graphNeighbors = Object.keys(this.codeGraph.nodes).length > 0
+                ? getRelatedFilesFromGraph(this.codeGraph, normalized, maxGraphNeighbors)
+                : [];
+            blocks.push(formatFileRepositoryBlock(normalized, symbols, graphNeighbors));
+        }
+
+        return {
+            content: formatRepositoryMapBlocks(blocks),
+            missingPaths,
+        };
+    }
+
+    public async queryRelations(entityName?: string, filePath?: string, relationType?: string): Promise<any[]> {
+        const nodeCount = Object.keys(this.codeGraph.nodes).length;
+        if (
+            this.codeGraphSqliteStore &&
+            nodeCount >= CODE_GRAPH_SQL_QUERY_NODE_THRESHOLD
+        ) {
+            try {
+                const results = await this.codeGraphSqliteStore.queryRelations(entityName, filePath, relationType);
+                console.log(`[CodeGraph] queryRelations(SQL): entityName="${entityName || ''}", filePath="${filePath || ''}", relationType="${relationType || ''}". Returning ${results.length} relations.`);
+                return results;
+            } catch (err) {
+                console.warn('[CodeGraph] SQL queryRelations failed, falling back to memory:', err);
+                return this.queryRelationsFromMemory(entityName, filePath, relationType);
+            }
+        }
+        return this.queryRelationsFromMemory(entityName, filePath, relationType);
+    }
+
+    private queryRelationsFromMemory(entityName?: string, filePath?: string, relationType?: string): any[] {
+        const results: any[] = [];
+        const normalizedFile = filePath ? path.normalize(filePath) : undefined;
+
+        for (const edge of this.codeGraph.edges) {
+            const fromNode = this.codeGraph.nodes[edge.from];
+            const toNode = this.codeGraph.nodes[edge.to];
+            if (!fromNode || !toNode) {
+                continue;
+            }
+
+            if (relationType && edge.kind !== relationType) {
+                continue;
+            }
+
+            if (normalizedFile && fromNode.filePath !== normalizedFile && toNode.filePath !== normalizedFile) {
+                continue;
+            }
+
+            if (entityName) {
+                const nameLower = entityName.toLowerCase();
+                const fromMatch = fromNode.symbolName?.toLowerCase().includes(nameLower);
+                const toMatch = toNode.symbolName?.toLowerCase().includes(nameLower);
+                if (!fromMatch && !toMatch) {
+                    continue;
+                }
+            }
+
+            results.push({
+                from: {
+                    filePath: fromNode.filePath,
+                    symbolName: fromNode.symbolName,
+                    startLine: fromNode.startLine,
+                    endLine: fromNode.endLine,
+                    symbolType: fromNode.symbolType,
+                },
+                to: {
+                    filePath: toNode.filePath,
+                    symbolName: toNode.symbolName,
+                    startLine: toNode.startLine,
+                    endLine: toNode.endLine,
+                    symbolType: toNode.symbolType,
+                },
+                kind: edge.kind,
+            });
+        }
+        console.log(`[CodeGraph] queryRelations: queried for entityName="${entityName || ''}", filePath="${filePath || ''}", relationType="${relationType || ''}". Returning ${results.length} relations.`);
+        return results;
     }
 }

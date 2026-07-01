@@ -237,7 +237,7 @@ export class BreadcrumbsControl {
 	private readonly _disposables = new DisposableStore();
 	private readonly _breadcrumbsDisposables = new DisposableStore();
 	private readonly _labels: ResourceLabels;
-	private readonly _model = new MutableDisposable<BreadcrumbsModel>();
+	private readonly _model = this._disposables.add(new MutableDisposable<BreadcrumbsModel>());
 	private _breadcrumbsPickerShowing = false;
 	private _breadcrumbsPickerIgnoreOnceItem: BreadcrumbsItem | undefined;
 

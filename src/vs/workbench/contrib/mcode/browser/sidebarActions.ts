@@ -251,6 +251,22 @@ registerAction2(class extends Action2 {
 	}
 })
 
+// Codebase Graph Action
+registerAction2(class extends Action2 {
+	constructor() {
+		super({
+			id: 'void.graphAction',
+			title: 'View Codebase Graph',
+			icon: { id: 'organization' },
+			menu: [{ id: MenuId.ViewTitle, group: 'navigation', when: ContextKeyExpr.equals('view', VOID_VIEW_ID), order: 1 }]
+		});
+	}
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const commandService = accessor.get(ICommandService);
+		commandService.executeCommand('void.showGraph');
+	}
+})
+
 
 
 

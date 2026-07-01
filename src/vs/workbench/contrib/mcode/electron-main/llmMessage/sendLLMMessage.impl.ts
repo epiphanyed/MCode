@@ -8,8 +8,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Ollama } from 'ollama';
 import OpenAI, { ClientOptions, AzureOpenAI } from 'openai';
-import { MistralCore } from '@mistralai/mistralai/core.js';
-import { fimComplete } from '@mistralai/mistralai/funcs/fimComplete.js';
+
 import { Tool as GeminiTool, FunctionDeclaration, GoogleGenAI, ThinkingConfig, Schema, Type } from '@google/genai';
 import { GoogleAuth } from 'google-auth-library'
 /* eslint-enable */
@@ -94,18 +93,7 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 		const thisConfig = settingsOfProvider[providerName]
 		return new OpenAI({ baseURL: `${thisConfig.endpoint}/v1`, apiKey: 'noop', ...commonPayloadOpts })
 	}
-	else if (providerName === 'openRouter') {
-		const thisConfig = settingsOfProvider[providerName]
-		return new OpenAI({
-			baseURL: 'https://openrouter.ai/api/v1',
-			apiKey: thisConfig.apiKey,
-			defaultHeaders: {
-				'HTTP-Referer': 'https://github.com/mcodeeditor/mcode', // Optional, for including your app on openrouter.ai rankings.
-				'X-Title': 'MCode', // Optional. Shows in rankings on openrouter.ai.
-			},
-			...commonPayloadOpts,
-		})
-	}
+
 	else if (providerName === 'googleVertex') {
 		// https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/call-vertex-using-openai-library
 		const thisConfig = settingsOfProvider[providerName]
@@ -155,18 +143,7 @@ const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName, includ
 		const headers = parseHeadersJSON(thisConfig.headersJSON)
 		return new OpenAI({ baseURL: thisConfig.endpoint, apiKey: thisConfig.apiKey, defaultHeaders: headers, ...commonPayloadOpts })
 	}
-	else if (providerName === 'groq') {
-		const thisConfig = settingsOfProvider[providerName]
-		return new OpenAI({ baseURL: 'https://api.groq.com/openai/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
-	}
-	else if (providerName === 'xAI') {
-		const thisConfig = settingsOfProvider[providerName]
-		return new OpenAI({ baseURL: 'https://api.x.ai/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
-	}
-	else if (providerName === 'mistral') {
-		const thisConfig = settingsOfProvider[providerName]
-		return new OpenAI({ baseURL: 'https://api.mistral.ai/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
-	}
+
 
 	else throw new Error(`Void providerName was invalid: ${providerName}.`)
 }
@@ -580,41 +557,7 @@ const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessag
 
 
 
-// ------------ MISTRAL ------------
-// https://docs.mistral.ai/api/#tag/fim
-const sendMistralFIM = ({ messages, onFinalMessage, onError, settingsOfProvider, overridesOfModel, modelName: modelName_, _setAborter, providerName }: SendFIMParams_Internal) => {
-	const { modelName, supportsFIM } = getModelCapabilities(providerName, modelName_, overridesOfModel)
-	if (!supportsFIM) {
-		if (modelName === modelName_)
-			onError({ message: `Model ${modelName} does not support FIM.`, fullError: null })
-		else
-			onError({ message: `Model ${modelName_} (${modelName}) does not support FIM.`, fullError: null })
-		return
-	}
 
-	const mistral = new MistralCore({ apiKey: settingsOfProvider.mistral.apiKey })
-	fimComplete(mistral,
-		{
-			model: modelName,
-			prompt: messages.prefix,
-			suffix: messages.suffix,
-			stream: false,
-			maxTokens: 300,
-			stop: messages.stopTokens,
-		})
-		.then(async response => {
-
-			// unfortunately, _setAborter() does not exist
-			let content = response?.ok ? response.value.choices?.[0]?.message?.content ?? '' : '';
-			const fullText = typeof content === 'string' ? content
-				: content.map(chunk => (chunk.type === 'text' ? chunk.text : '')).join('')
-
-			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
-		})
-		.catch(error => {
-			onError({ message: error + '', fullError: error });
-		})
-}
 
 
 // ------------ OLLAMA ------------
@@ -865,19 +808,9 @@ export const sendLLMMessageToProviderImplementation = {
 		sendFIM: null,
 		list: null,
 	},
-	xAI: {
-		sendChat: (params) => _sendOpenAICompatibleChat(params),
-		sendFIM: null,
-		list: null,
-	},
 	gemini: {
 		sendChat: (params) => sendGeminiChat(params),
 		sendFIM: null,
-		list: null,
-	},
-	mistral: {
-		sendChat: (params) => _sendOpenAICompatibleChat(params),
-		sendFIM: (params) => sendMistralFIM(params),
 		list: null,
 	},
 	ollama: {
@@ -890,22 +823,12 @@ export const sendLLMMessageToProviderImplementation = {
 		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
 		list: null,
 	},
-	openRouter: {
-		sendChat: (params) => _sendOpenAICompatibleChat(params),
-		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
-		list: null,
-	},
 	vLLM: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
 		list: (params) => _openaiCompatibleList(params),
 	},
 	deepseek: {
-		sendChat: (params) => _sendOpenAICompatibleChat(params),
-		sendFIM: null,
-		list: null,
-	},
-	groq: {
 		sendChat: (params) => _sendOpenAICompatibleChat(params),
 		sendFIM: null,
 		list: null,

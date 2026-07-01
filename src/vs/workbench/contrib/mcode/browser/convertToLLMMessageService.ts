@@ -22,6 +22,13 @@ import { estimateTokenCount, MIN_RETAINED_CHARS } from '../common/helpers/tokenE
 import { stripDiagramBlocksForLlm } from '../common/helpers/diagramBlockStripper.js';
 import { stripFileHeaderForToolOutput } from '../common/helpers/fileHeaderStripper.js';
 import { agentReadRegistryKey } from '../common/helpers/agentReadRegistry.js';
+import {
+	buildConsecutiveGatherWarning,
+	countConsecutiveGathers,
+	detectAgentDeliverablePath,
+	getActiveReadsLimit,
+} from '../common/helpers/agentGatherBudget.js';
+import { ragLogStage } from '../common/helpers/ragDebugLog.js';
 import { BuiltinToolCallParams } from '../common/toolsServiceTypes.js';
 import { IRepositoryMapService } from '../common/repositoryMapService.js';
 
@@ -761,8 +768,8 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		}
 
 		// Keep only the most recent N active read calls
-		const MAX_ACTIVE_READS = 5;
-		const slicedActiveKeys = activeReadKeys.slice(0, MAX_ACTIVE_READS);
+		const activeReadsLimit = getActiveReadsLimit(contextWindow);
+		const slicedActiveKeys = activeReadKeys.slice(0, activeReadsLimit);
 		const slicedActiveKeysSet = new Set(slicedActiveKeys);
 		console.log('[RAG][debug] slicedActiveKeysSet:', Array.from(slicedActiveKeysSet));
 
@@ -904,11 +911,11 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 		// Generate the Repository Map
 		let repositoryMapSection = '';
 		try {
-			console.log('[RepositoryMap] Gathering codebase map signatures for relevant files:', relevantURIs.map(u => u.fsPath));
+			console.log('[RepositoryMap] Gathering codebase map from symbol index + graph for:', relevantURIs.map(u => u.fsPath));
 			const repositoryMapContent = await this.repositoryMapService.getRepositoryMap(relevantURIs);
 			if (repositoryMapContent) {
 				console.log(`[RepositoryMap] Generated map size: ${repositoryMapContent.length} characters.`);
-				repositoryMapSection = `\n\n[REPOSITORY MAP]\nHere are the class/function signatures of files relevant to your current focus:\n${repositoryMapContent}`;
+				repositoryMapSection = `\n\n[REPOSITORY MAP]\nIndexed symbol map (Tree-sitter) and 1-hop graph neighbors for files in focus. Use start_line/end_line on read_file for precise ranges:\n${repositoryMapContent}`;
 			}
 		} catch (e) {
 			console.error('[RepositoryMap] Error generating repository map:', e);
@@ -920,6 +927,16 @@ class ConvertToLLMMessageService extends Disposable implements IConvertToLLMMess
 
 		if (systemMessage && activeFilesSection) {
 			systemMessage += activeFilesSection;
+		}
+
+		if (chatMode === 'agent' && systemMessage) {
+			const gatherCount = countConsecutiveGathers(chatMessages);
+			const deliverablePath = detectAgentDeliverablePath(chatMessages);
+			const gatherWarning = buildConsecutiveGatherWarning(gatherCount, deliverablePath);
+			if (gatherWarning) {
+				systemMessage += gatherWarning;
+				ragLogStage('gather-budget', `count=${gatherCount} deliverable=${deliverablePath ?? '(none)'}`);
+			}
 		}
 
 		const modelSelectionOptions = this.mcodeSettingsService.state.optionsOfModelSelection['Chat'][modelSelection.providerName]?.[modelSelection.modelName]

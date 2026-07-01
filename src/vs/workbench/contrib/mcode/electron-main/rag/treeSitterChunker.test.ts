@@ -24,6 +24,8 @@ suite('treeSitterChunker', () => {
 		assert.ok(canTreeSitterParse('a.ts'));
 		assert.ok(canTreeSitterParse('a.js'));
 		assert.ok(canTreeSitterParse('a.py'));
+		assert.ok(canTreeSitterParse('a.kt'));
+		assert.ok(canTreeSitterParse('build.gradle.kts'));
 		assert.ok(!canTreeSitterParse('a.sci'));
 		assert.ok(!canTreeSitterParse('a.m'));
 	});
@@ -92,5 +94,43 @@ export function handleRequest(): void {}
 		assert.ok(handleChunk);
 		assert.ok(!handleChunk!.text.includes('Copyright 2026'));
 		assert.ok(handleChunk!.text.includes('Process incoming request'));
+	});
+
+	test('tree-sitter Kotlin extracts class, interface, property, and expression-body fun', async function () {
+		await skipUnlessTreeSitterRuntime.call(this);
+		const content = `class MyKotlinClass {
+    fun processData(input: String): Int {
+        return input.length
+    }
+}
+
+interface MyInterface { fun foo(): Unit }
+
+enum class Color { RED, GREEN }
+
+val topLevel = 1
+
+fun topLevelFun() = 42
+`;
+		const chunks = await chunkWithTreeSitter(content, 'Sample.kt');
+		assert.ok(chunks && chunks.length >= 5);
+		assert.ok(chunks!.some(c => c.symbolType === 'class' && c.symbolName === 'MyKotlinClass'));
+		assert.ok(chunks!.some(c => c.symbolType === 'interface' && c.symbolName === 'MyInterface'));
+		assert.ok(chunks!.some(c => c.symbolType === 'enum' && c.symbolName === 'Color'));
+		assert.ok(chunks!.some(c => c.symbolType === 'property' && c.symbolName === 'topLevel'));
+		assert.ok(chunks!.some(c => c.symbolType === 'function' && c.symbolName === 'topLevelFun'));
+	});
+
+	test('chunkCodeForIndexing prefers AST for Kotlin', async function () {
+		await skipUnlessTreeSitterRuntime.call(this);
+		const content = `object CompanionObject {
+    fun logMessage(msg: String) { println(msg) }
+}
+
+fun greet() = "hello"
+`;
+		const chunks = await chunkCodeForIndexing(content, 'Main.kt');
+		assert.ok(chunks.some(c => c.symbolType === 'class' && c.symbolName === 'CompanionObject'));
+		assert.ok(chunks.some(c => c.symbolType === 'function' && c.symbolName === 'greet'));
 	});
 });

@@ -53,6 +53,14 @@ async function runBootstrap(
 		ollamaEndpoint: gs.ollamaEndpoint ?? DEFAULT_RAG_EMBEDDING.ollamaEndpoint,
 	};
 
+	const indexStatus = await ragService.getIndexStatus();
+	if (indexStatus.phase !== 'idle') {
+		console.log(
+			`[RAG] Index already ${indexStatus.phase} (${indexStatus.filesDone}/${indexStatus.filesTotal}); skipping duplicate bootstrap.`,
+		);
+		return;
+	}
+
 	try {
 		const actualType = await ragService.initializeIndex(
 			workspaceRoot,

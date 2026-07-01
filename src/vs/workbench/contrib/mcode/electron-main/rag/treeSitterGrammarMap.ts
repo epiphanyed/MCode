@@ -23,6 +23,8 @@ export const TREE_SITTER_GRAMMAR_BY_EXT: Record<string, string> = {
 	'.rs': 'tree-sitter-rust',
 	'.cs': 'tree-sitter-c-sharp',
 	'.rb': 'tree-sitter-ruby',
+	'.kt': 'tree-sitter-kotlin',
+	'.kts': 'tree-sitter-kotlin',
 };
 
 export function canTreeSitterParse(filePath: string): boolean {

@@ -27,6 +27,7 @@ const GIT_INTENT_PATTERNS: RegExp[] = [
 const SOURCE_EXTENSIONS = new Set([
 	'.ts', '.tsx', '.js', '.jsx', '.cpp', '.h', '.hpp', '.c', '.cc', '.cxx',
 	'.py', '.java', '.m', '.sci', '.sce', '.md', '.txt', '.json', '.yaml', '.yml',
+	'.kt', '.kts'
 ]);
 
 const DIFF_SKIP_PATTERNS = [

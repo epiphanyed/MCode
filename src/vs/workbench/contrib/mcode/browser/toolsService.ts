@@ -17,7 +17,9 @@ import { IMarkerService, MarkerSeverity } from '../../../../platform/markers/com
 import { timeout } from '../../../../base/common/async.js'
 import { RawToolParamsObj } from '../common/sendLLMMessageTypes.js'
 import { MAX_CHILDREN_URIs_PAGE, MAX_FILE_CHARS_PAGE, MAX_READ_FILES_BATCH, MAX_READ_FILES_COMBINED_PAGE, MAX_TERMINAL_BG_COMMAND_TIME, MAX_TERMINAL_INACTIVE_TIME } from '../common/prompt/prompts.js'
+import { capSearchPathListResult } from '../common/helpers/agentGatherBudget.js'
 import { IVoidSettingsService } from '../common/mcodeSettingsService.js'
+import { IVoidRagService } from '../common/mcodeRagTypes.js'
 import { generateUuid } from '../../../../base/common/uuid.js'
 import { stripFileHeaderForToolOutput } from '../common/helpers/fileHeaderStripper.js'
 import { stripDiagramBlocksForToolOutput } from '../common/helpers/diagramBlockStripper.js'
@@ -232,6 +234,7 @@ export class ToolsService implements IToolsService {
 		@IDirectoryStrService private readonly directoryStrService: IDirectoryStrService,
 		@IMarkerService private readonly markerService: IMarkerService,
 		@IVoidSettingsService private readonly mcodeSettingsService: IVoidSettingsService,
+		@IVoidRagService private readonly ragService: IVoidRagService,
 	) {
 		const queryBuilder = instantiationService.createInstance(QueryBuilder);
 
@@ -313,6 +316,26 @@ export class ToolsService implements IToolsService {
 				} = params
 				const uri = validateURI(uriUnknown)
 				return { uri }
+			},
+
+			query_codebase_relations: (params: RawToolParamsObj) => {
+				const {
+					entity_name: entityNameUnknown,
+					file_path: filePathUnknown,
+					relation_type: relationTypeUnknown,
+				} = params;
+				const entityName = entityNameUnknown !== undefined ? validateStr('entity_name', entityNameUnknown) : undefined;
+				const filePath = filePathUnknown !== undefined ? validateStr('file_path', filePathUnknown) : undefined;
+				let relationType: 'calls' | 'imports' | 'inherits' | 'contains' | undefined = undefined;
+				if (relationTypeUnknown !== undefined) {
+					const rel = validateStr('relation_type', relationTypeUnknown);
+					if (rel === 'calls' || rel === 'imports' || rel === 'inherits' || rel === 'contains') {
+						relationType = rel;
+					} else {
+						throw new Error(`Invalid relation_type: ${rel}. Allowed values: 'calls', 'imports', 'inherits', 'contains'.`);
+					}
+				}
+				return { entityName, filePath, relationType };
 			},
 
 			// ---
@@ -508,6 +531,13 @@ export class ToolsService implements IToolsService {
 				return { result: { lintErrors } }
 			},
 
+			query_codebase_relations: async ({ entityName, filePath, relationType }) => {
+				console.log(`[Tool] query_codebase_relations executed: entityName="${entityName || ''}", filePath="${filePath || ''}", relationType="${relationType || ''}"`);
+				const relations = await this.ragService.queryRelations(entityName, filePath, relationType);
+				console.log(`[Tool] query_codebase_relations results: returned ${relations.length} relations.`);
+				return { result: { relations } };
+			},
+
 			// ---
 
 			create_file_or_folder: async ({ uri, isFolder }) => {
@@ -614,10 +644,20 @@ export class ToolsService implements IToolsService {
 				return result.str
 			},
 			search_pathnames_only: (params, result) => {
-				return result.uris.map(uri => uri.fsPath).join('\n') + nextPageStr(result.hasNextPage)
+				return capSearchPathListResult(
+					result.uris.map(uri => uri.fsPath),
+					params.pageNumber,
+					result.hasNextPage,
+					nextPageStr(result.hasNextPage),
+				);
 			},
 			search_for_files: (params, result) => {
-				return result.uris.map(uri => uri.fsPath).join('\n') + nextPageStr(result.hasNextPage)
+				return capSearchPathListResult(
+					result.uris.map(uri => uri.fsPath),
+					params.pageNumber,
+					result.hasNextPage,
+					nextPageStr(result.hasNextPage),
+				);
 			},
 			search_in_file: (params, result) => {
 				const { model } = mcodeModelService.getModel(params.uri)
@@ -632,6 +672,16 @@ export class ToolsService implements IToolsService {
 				return result.lintErrors ?
 					stringifyLintErrors(result.lintErrors)
 					: 'No lint errors found.'
+			},
+			query_codebase_relations: (params, result) => {
+				if (!result.relations || result.relations.length === 0) {
+					return 'No codebase relations found matching the criteria.';
+				}
+				return result.relations.map(rel => {
+					const fromStr = rel.from.symbolName ? `${rel.from.symbolName} (${rel.from.filePath}:${rel.from.startLine})` : rel.from.filePath;
+					const toStr = rel.to.symbolName ? `${rel.to.symbolName} (${rel.to.filePath}:${rel.to.startLine})` : rel.to.filePath;
+					return `- ${fromStr} ${rel.kind === 'calls' ? 'calls' : 'imports'} ${toStr}`;
+				}).join('\n');
 			},
 			// ---
 			create_file_or_folder: (params, result) => {

@@ -102,7 +102,7 @@ class McodeRagSyncContribution extends Disposable implements IWorkbenchContribut
 
 		try {
 			const activeType = await this.ragService.getActiveIndexType();
-			if (activeType !== 'local') {
+			if (activeType !== 'local' && activeType !== 'milvus') {
 				return;
 			}
 			await this.ragService.applyIncrementalChanges(changes);

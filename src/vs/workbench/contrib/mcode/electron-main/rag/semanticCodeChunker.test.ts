@@ -151,4 +151,37 @@ endfunction
 		assert.strictEqual(fn!.text.includes('Copyright 2026 Example'), false);
 		assert.strictEqual(fn!.startLine > 4, true);
 	});
+
+	test('Kotlin class and function', () => {
+		const content = `class MyKotlinClass {
+    fun processData(input: String): Int {
+        return input.length
+    }
+}
+
+object CompanionObject {
+    fun logMessage(msg: String) {
+        println(msg)
+    }
+}
+
+interface MyInterface {
+    fun foo(): Unit
+}
+
+enum class Color { RED, GREEN }
+
+val topLevel = 1
+
+fun topLevelFun() = 42
+`;
+		const chunks = chunkCodeSemantically(content, 'Test.kt');
+		assert.ok(chunks.some(c => c.symbolType === 'class' && c.symbolName === 'MyKotlinClass'));
+		assert.ok(chunks.some(c => c.symbolType === 'class' && c.symbolName === 'CompanionObject'));
+		assert.ok(chunks.some(c => c.symbolType === 'interface' && c.symbolName === 'MyInterface'));
+		assert.ok(chunks.some(c => c.symbolType === 'enum' && c.symbolName === 'Color'));
+		assert.ok(chunks.some(c => c.symbolType === 'property' && c.symbolName === 'topLevel'));
+		assert.ok(chunks.some(c => c.symbolType === 'function' && c.symbolName === 'topLevelFun'));
+		assert.ok(!chunks.some(c => c.symbolName === 'processData'));
+	});
 });

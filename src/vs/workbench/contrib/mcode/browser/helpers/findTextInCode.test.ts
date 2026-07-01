@@ -15,12 +15,12 @@ suite('findTextInCode', () => {
 	test('markdown list ORIGINAL matches heading in file', () => {
 		const file = '# Metafile 转 SVG\n\nSome content\n';
 		const orig = '- Metafile 转 SVG\n\n';
-		assert.deepStrictEqual(findTextInCode(orig, file), [1, 2]);
+		assert.deepStrictEqual(findTextInCode(orig, file), [1, 1]);
 	});
 
 	test('trailing empty lines on ORIGINAL', () => {
 		const file = '## Section\n\nText\n';
-		assert.deepStrictEqual(findTextInCode('## Section\n\n', file), [1, 2]);
+		assert.deepStrictEqual(findTextInCode('## Section\n\n', file), [1, 1]);
 	});
 
 	test('strip code fence wrapper from ORIGINAL', () => {

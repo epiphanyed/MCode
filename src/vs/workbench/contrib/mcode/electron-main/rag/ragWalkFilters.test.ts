@@ -5,8 +5,13 @@
 
 import * as assert from 'assert';
 import {
+	compareIndexFilePriority,
+	compareWalkDirectoryNames,
+	getIndexFilePriority,
+	isPathIgnoredByPatterns,
 	pathContainsSkippedDirectory,
 	shouldSkipDirectoryName,
+	sortFilesForIndexing,
 	splitPathSegments,
 } from './ragWalkFilters.js';
 
@@ -40,5 +45,42 @@ suite('ragWalkFilters', () => {
 			splitPathSegments('D:/work/project/.github\\workflows/ci.yml'),
 			['D:', 'work', 'project', '.github', 'workflows', 'ci.yml'],
 		);
+	});
+
+	test('getIndexFilePriority prefers workspace src over external and nested src', () => {
+		const root = 'D:\\work\\doc_morph';
+		assert.strictEqual(getIndexFilePriority('D:\\work\\doc_morph\\src\\main.ts', root), 0);
+		assert.strictEqual(getIndexFilePriority('D:\\work\\doc_morph\\include\\foo.h', root), 1);
+		assert.strictEqual(getIndexFilePriority('D:\\work\\doc_morph\\external\\boost\\src\\vector.hpp', root), 2);
+	});
+
+	test('sortFilesForIndexing puts workspace src first and external last', () => {
+		const root = 'D:/work/doc_morph';
+		const files = [
+			'D:/work/doc_morph/external/boost/foo.hpp',
+			'D:/work/doc_morph/include/bar.h',
+			'D:/work/doc_morph/src/app/main.cpp',
+			'D:/work/doc_morph/src/util.ts',
+		];
+		const sorted = sortFilesForIndexing(files, root);
+		assert.strictEqual(sorted[0], 'D:/work/doc_morph/src/app/main.cpp');
+		assert.strictEqual(sorted[1], 'D:/work/doc_morph/src/util.ts');
+		assert.strictEqual(sorted[sorted.length - 1], 'D:/work/doc_morph/external/boost/foo.hpp');
+	});
+
+	test('compareWalkDirectoryNames visits src before external at workspace root', () => {
+		const root = 'D:/work/doc_morph';
+		assert.ok(compareWalkDirectoryNames('src', 'external', root, root) < 0);
+		assert.ok(compareWalkDirectoryNames('lib', 'external', root, root) < 0);
+		assert.ok(compareWalkDirectoryNames('external', 'src', root, root) > 0);
+		assert.strictEqual(compareIndexFilePriority('a.ts', 'b.ts', root), 'a.ts'.localeCompare('b.ts', undefined, { sensitivity: 'base' }));
+	});
+
+	test('isPathIgnoredByPatterns matches directory prefixes with trailing slash', () => {
+		const patterns = ['external/', 'src/generated/**'];
+		assert.strictEqual(isPathIgnoredByPatterns('external/boost/vector.hpp', patterns), true);
+		assert.strictEqual(isPathIgnoredByPatterns('external', patterns), true);
+		assert.strictEqual(isPathIgnoredByPatterns('src/main.ts', patterns), false);
+		assert.strictEqual(isPathIgnoredByPatterns('src/generated/foo.ts', patterns), true);
 	});
 });

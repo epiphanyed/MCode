@@ -190,3 +190,57 @@ for (let dir of dirs) {
 
 cp.execSync('git config pull.rebase merges');
 cp.execSync('git config blame.ignoreRevsFile .git-blame-ignore-revs');
+
+// Download tree-sitter-kotlin.wasm if it does not exist (not bundled in @vscode/tree-sitter-wasm).
+const KOTLIN_WASM_URL = 'https://unpkg.com/tree-sitter-wasms@1.3.0/out/tree-sitter-kotlin.wasm';
+const MIN_KOTLIN_WASM_BYTES = 100_000;
+
+function downloadKotlinWasm() {
+	const destDir = path.join(root, 'node_modules', '@vscode', 'tree-sitter-wasm', 'wasm');
+	const destFile = path.join(destDir, 'tree-sitter-kotlin.wasm');
+	if (fs.existsSync(destFile) && fs.statSync(destFile).size >= MIN_KOTLIN_WASM_BYTES) {
+		log('postinstall', `tree-sitter-kotlin.wasm already exists at ${destFile}`);
+		return;
+	}
+
+	if (!fs.existsSync(destDir)) {
+		fs.mkdirSync(destDir, { recursive: true });
+	}
+
+	const tmpFile = `${destFile}.tmp`;
+	log('postinstall', `Downloading tree-sitter-kotlin.wasm from ${KOTLIN_WASM_URL}...`);
+
+	let result = cp.spawnSync('curl', ['-fsSL', '-o', tmpFile, KOTLIN_WASM_URL], { stdio: 'inherit' });
+	if (result.status !== 0 && process.platform === 'win32') {
+		result = cp.spawnSync(
+			'powershell',
+			['-NoProfile', '-Command', `Invoke-WebRequest -Uri '${KOTLIN_WASM_URL}' -OutFile '${tmpFile.replace(/'/g, "''")}' -UseBasicParsing`],
+			{ stdio: 'inherit' },
+		);
+	}
+
+	if (result.status !== 0) {
+		if (fs.existsSync(tmpFile)) {
+			fs.unlinkSync(tmpFile);
+		}
+		console.error('[postinstall] Failed to download tree-sitter-kotlin.wasm');
+		process.exit(1);
+	}
+
+	const size = fs.statSync(tmpFile).size;
+	if (size < MIN_KOTLIN_WASM_BYTES) {
+		fs.unlinkSync(tmpFile);
+		console.error(`[postinstall] Downloaded tree-sitter-kotlin.wasm is too small (${size} bytes)`);
+		process.exit(1);
+	}
+
+	fs.renameSync(tmpFile, destFile);
+	log('postinstall', `Successfully downloaded tree-sitter-kotlin.wasm (${size} bytes)`);
+}
+
+try {
+	downloadKotlinWasm();
+} catch (e) {
+	console.error(`[postinstall] Failed to download tree-sitter-kotlin.wasm: ${e.message}`);
+	process.exit(1);
+}

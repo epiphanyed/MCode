@@ -5,6 +5,7 @@
 
 import { Event } from '../../../../base/common/event.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
+import type { RepositoryMapIndexResult } from './mcodeRagRepositoryMapTypes.js';
 
 export interface RagInitOptions {
 	/** When true, delete the existing local store and rebuild from scratch. */
@@ -165,6 +166,56 @@ export interface RagRelatedDependency {
 	reason: string;
 }
 
+export interface CodeGraphHubNode {
+	id: string;
+	degree: number;
+	filePath: string;
+	symbolName?: string;
+	symbolType?: string;
+}
+
+export interface CodeGraphCommunity {
+	id: number;
+	nodeIds: string[];
+	size: number;
+	label: string;
+	color: string;
+	method: 'louvain' | 'louvain-file' | 'components';
+	modularity?: number;
+}
+
+export interface CodeGraphViewPayload {
+	graph: any;
+	nodeDegrees: Record<string, number>;
+	hubNodes: CodeGraphHubNode[];
+	communities: CodeGraphCommunity[];
+	nodeCommunity: Record<string, number>;
+	communityColors: Record<number, string>;
+	communityMethod: 'louvain' | 'louvain-file' | 'components';
+	graphModularity?: number;
+	architectureReport: string;
+	viewMode?: 'full' | 'file' | 'file-sampled' | 'focus-symbol';
+	displayScope?: 'overview' | 'symbols' | 'calls';
+	focusFilePath?: string;
+	initialSearchQuery?: string;
+	totalNodeCount?: number;
+	fileSymbolIndex?: Record<string, string[]>;
+	symbolSearchIndex?: Record<string, Array<{
+		filePath: string;
+		startLine: number;
+		symbolName: string;
+		symbolType?: string;
+	}>>;
+}
+
+export type CodeGraphDisplayScope = 'overview' | 'symbols' | 'calls';
+
+export interface CodeGraphViewOptions {
+	displayScope?: CodeGraphDisplayScope;
+	focusFilePath?: string;
+	pendingSearchQuery?: string;
+}
+
 export interface IVoidRagService {
 	readonly _serviceBrand: undefined;
 
@@ -182,6 +233,11 @@ export interface IVoidRagService {
 	waitForIndexReady(timeoutMs?: number): Promise<boolean>;
 	getRelatedDependencies(filePath: string, maxResults?: number): Promise<RagRelatedDependency[]>;
 	applyIncrementalChanges(changes: RagFileChange[]): Promise<void>;
+	getCodeGraph(): Promise<any>;
+	getCodeGraphViewPayload(options?: CodeGraphViewOptions): Promise<CodeGraphViewPayload>;
+	queryRelations(entityName?: string, filePath?: string, relationType?: string): Promise<any[]>;
+	/** Symbol-map + graph slices for [REPOSITORY MAP]; missingPaths need live-editor fallback. */
+	getRepositoryMapFromIndex(filePaths: string[], maxGraphNeighbors?: number): Promise<RepositoryMapIndexResult>;
 }
 
 export const IVoidRagService = createDecorator<IVoidRagService>('mcodeRagService');

@@ -27,7 +27,7 @@ export const MAX_FILE_CHARS_PAGE = 16_000
 /** Max combined chars per read_files page (fixed cap; not multiplied by file count). */
 export const MAX_READ_FILES_COMBINED_PAGE = MAX_FILE_CHARS_PAGE
 export const MAX_READ_FILES_BATCH = 8
-export const MAX_CHILDREN_URIs_PAGE = 500
+export const MAX_CHILDREN_URIs_PAGE = 100
 
 /** @file staging: summary mode limits (CTX-B5). */
 export const FILE_SELECTION_SUMMARY_MAX_CHARS = 4_000
@@ -293,6 +293,16 @@ PAGINATION (required): Results are capped at ${MAX_READ_FILES_COMBINED_PAGE} com
 		},
 	},
 
+	query_codebase_relations: {
+		name: 'query_codebase_relations',
+		description: `Use this tool to query codebase relationship networks: function/method calls, file imports, class inheritance (extends/implements), and structural containment (class/file contains symbol). Filter by entity name, file path, or relation_type ('calls' | 'imports' | 'inherits' | 'contains'). Prefer this over read_file when exploring structure.`,
+		params: {
+			entity_name: { description: 'Optional. Query relationships containing this class, interface, function, or method name.' },
+			file_path: { description: 'Optional. Query relationships associated with this file path.' },
+			relation_type: { description: 'Optional. Filter by relation type: \'calls\', \'imports\', \'inherits\', or \'contains\'.' }
+		}
+	},
+
 	// --- editing (create/delete) ---
 
 	create_file_or_folder: {
@@ -536,6 +546,7 @@ ${directoryStr}
 - If a read result says it was loaded into [ACTIVE FILES CONTEXT], or [already read], do **not** read the same path/page again — use what you have and write into the .md.
 - Include mermaid diagrams inside the .md as you go; do not defer all diagrams to the final step.
 - When enough sections exist to answer the user, stop reading new files and finalize the .md.`)
+		details.push(`**Use the codebase graph to navigate efficiently:** Before using heavy tools like \`read_file\` or \`search_for_files\`, prefer \`query_codebase_relations\` for call graphs, imports, inheritance, and containment (relation_type: calls | imports | inherits | contains).`)
 		details.push(`For code edits (not documentation): gather context for the specific change, then edit. You do not need every related file in the repo first.`)
 		details.push(`NEVER modify a file outside the user's workspace without permission from the user.`)
 	}

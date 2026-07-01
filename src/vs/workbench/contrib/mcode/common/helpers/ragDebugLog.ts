@@ -26,7 +26,15 @@ export const RAG_LOG_BODY_MAX = LOG_CHUNK_SIZE;
 
  */
 
+function isTestEnv(): boolean {
+	return typeof (globalThis as any).suite === 'function' || typeof (globalThis as any).test === 'function';
+}
+
 export function logLongText(tag: string, text: string | null | undefined, chunkSize = LOG_CHUNK_SIZE): void {
+
+	if (isTestEnv()) {
+		return;
+	}
 
 	const body = text ?? '';
 
@@ -64,6 +72,10 @@ export function logLongText(tag: string, text: string | null | undefined, chunkS
 
 export function ragLogStage(stage: string, message: string): void {
 
+	if (isTestEnv()) {
+		return;
+	}
+
 	console.log(`[RAG][${stage}] ${message}`);
 
 }
@@ -71,6 +83,10 @@ export function ragLogStage(stage: string, message: string): void {
 
 
 export function ragLogElapsed(stage: string, label: string, startMs: number): void {
+
+	if (isTestEnv()) {
+		return;
+	}
 
 	console.log(`[RAG][${stage}] ${label} +${Date.now() - startMs}ms`);
 

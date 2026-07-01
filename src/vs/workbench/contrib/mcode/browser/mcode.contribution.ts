@@ -94,4 +94,5 @@ import '../common/mcodeModelService.js'
 
 // repository map service
 import '../common/repositoryMapService.js'
+import './mcodeGraphWebview.js'
 

@@ -68,9 +68,19 @@ usearch/node_modules/**
 
 @vscode/tree-sitter-wasm/wasm/tree-sitter-*.wasm
 !@vscode/tree-sitter-wasm/wasm/tree-sitter-typescript.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-tsx.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-javascript.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-cpp.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-python.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-java.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-go.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-rust.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-c-sharp.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-ruby.wasm
 !@vscode/tree-sitter-wasm/wasm/tree-sitter-regex.wasm
 !@vscode/tree-sitter-wasm/wasm/tree-sitter-ini.wasm
 !@vscode/tree-sitter-wasm/wasm/tree-sitter-css.wasm
+!@vscode/tree-sitter-wasm/wasm/tree-sitter-kotlin.wasm
 
 native-keymap/binding.gyp
 native-keymap/build/**

@@ -57,6 +57,8 @@ import {
 	rebuildAgentReadRegistryFromMessages,
 	stubAlreadyReadToolResult,
 } from '../common/helpers/agentReadRegistry.js';
+import { getActiveReadsLimit } from '../common/helpers/agentGatherBudget.js';
+import { getModelCapabilities } from '../common/modelCapabilities.js';
 import { shouldDeferAgentEditReview } from '../common/helpers/agentDeferredEditReview.js';
 import { taskPlanItemKey } from '../common/helpers/taskPlanParser.js';
 import { ILlamaServerContextService } from '../common/llamaServerContextService.js';
@@ -1082,7 +1084,14 @@ class ChatThreadService extends Disposable implements IChatThreadService {
 					}
 				}
 			}
-			const activeReadRegistry = activeReadKeys.slice(0, 5);
+			let contextWindow = 32000;
+			if (modelSelection) {
+				const { overridesOfModel } = this._settingsService.state;
+				const caps = getModelCapabilities(modelSelection.providerName, modelSelection.modelName, overridesOfModel);
+				contextWindow = caps.contextWindow;
+			}
+			const activeReadsLimit = getActiveReadsLimit(contextWindow);
+			const activeReadRegistry = activeReadKeys.slice(0, activeReadsLimit);
 			this._setThreadState(threadId, { agentReadRegistry: activeReadRegistry });
 			const lastUserMsgIdx = findLastIdx(chatMessages, m => m.role === 'user')
 			if (nMessagesSent === 1 && lastUserMsgIdx !== -1) {

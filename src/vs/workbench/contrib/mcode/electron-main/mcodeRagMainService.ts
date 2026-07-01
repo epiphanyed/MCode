@@ -39,6 +39,7 @@ import {
 	RagRelatedDependency,
 
 } from '../common/mcodeRagTypes.js';
+import type { RepositoryMapIndexResult } from '../common/mcodeRagRepositoryMapTypes.js';
 
 import { LlamaIndexService } from './rag/llamaIndexService.js';
 
@@ -131,6 +132,30 @@ export class VoidRagService implements IVoidRagService {
 	async testMilvusConnection(config: RagMilvusConfig): Promise<RagMilvusConnectionResult> {
 
 		return this.llamaIndexService.testMilvusConnection(config);
+
+	}
+
+	async getCodeGraph(): Promise<any> {
+
+		return this.llamaIndexService.getCodeGraph();
+
+	}
+
+	async getCodeGraphViewPayload(options?: import('../common/mcodeRagTypes.js').CodeGraphViewOptions) {
+
+		return this.llamaIndexService.getCodeGraphViewPayload(options);
+
+	}
+
+	async queryRelations(entityName?: string, filePath?: string, relationType?: string): Promise<any[]> {
+
+		return this.llamaIndexService.queryRelations(entityName, filePath, relationType);
+
+	}
+
+	async getRepositoryMapFromIndex(filePaths: string[], maxGraphNeighbors?: number): Promise<RepositoryMapIndexResult> {
+
+		return this.llamaIndexService.getRepositoryMapFromIndex(filePaths, maxGraphNeighbors);
 
 	}
 

@@ -37,21 +37,86 @@ const NODE_TYPE_TO_SYMBOL: Record<string, string> = {
 	struct_declaration: 'struct',
 	struct_item: 'struct',
 	impl_item: 'class',
+	object_declaration: 'class',
+	property: 'property',
+	property_declaration: 'property',
 };
 
 const SEMANTIC_NODE_TYPES = new Set(Object.keys(NODE_TYPE_TO_SYMBOL));
+
+const IDENTIFIER_NODE_TYPES = new Set([
+	'identifier',
+	'type_identifier',
+	'property_identifier',
+	'simple_identifier',
+]);
 
 const MIN_CHUNK_CHARS = 8;
 
 function nodeNameFromField(node: Parser.Node, fieldName: string): string | undefined {
 	const field = node.childForFieldName(fieldName);
-	if (field && (field.type === 'identifier' || field.type === 'type_identifier' || field.type === 'property_identifier')) {
+	if (field && IDENTIFIER_NODE_TYPES.has(field.type)) {
 		return field.text;
 	}
 	return undefined;
 }
 
+function kotlinFunctionName(node: Parser.Node): string | undefined {
+	if (node.type !== 'function_declaration') {
+		return undefined;
+	}
+	for (let i = 0; i < node.childCount; i++) {
+		const child = node.child(i)!;
+		if (child.type === 'simple_identifier') {
+			return child.text;
+		}
+	}
+	return undefined;
+}
+
+function kotlinPropertyName(node: Parser.Node): string | undefined {
+	if (node.type !== 'property_declaration') {
+		return undefined;
+	}
+	for (let i = 0; i < node.childCount; i++) {
+		const child = node.child(i)!;
+		if (child.type === 'variable_declaration') {
+			for (let j = 0; j < child.childCount; j++) {
+				const part = child.child(j)!;
+				if (part.type === 'simple_identifier') {
+					return part.text;
+				}
+			}
+		}
+		if (child.type === 'simple_identifier') {
+			return child.text;
+		}
+	}
+	return undefined;
+}
+
+function resolveSymbolType(node: Parser.Node, defaultType: string): string {
+	const trimmed = node.text.trimStart();
+	if (node.type === 'class_declaration') {
+		if (/^interface\b/.test(trimmed)) {
+			return 'interface';
+		}
+		if (/^enum\s+class\b/.test(trimmed)) {
+			return 'enum';
+		}
+	}
+	return defaultType;
+}
+
 function extractSymbolName(node: Parser.Node, symbolType: string, text: string): string | undefined {
+	const kotlinFn = kotlinFunctionName(node);
+	if (kotlinFn) {
+		return kotlinFn;
+	}
+	const kotlinProp = kotlinPropertyName(node);
+	if (kotlinProp) {
+		return kotlinProp;
+	}
 	const fromField =
 		nodeNameFromField(node, 'name')
 		?? nodeNameFromField(node, 'declarator')
@@ -63,7 +128,7 @@ function extractSymbolName(node: Parser.Node, symbolType: string, text: string):
 }
 
 function findDescendantIdentifier(node: Parser.Node): string | undefined {
-	if (node.type === 'identifier' || node.type === 'type_identifier' || node.type === 'property_identifier') {
+	if (IDENTIFIER_NODE_TYPES.has(node.type)) {
 		return node.text;
 	}
 	for (let i = 0; i < node.childCount; i++) {
@@ -78,12 +143,13 @@ function findDescendantIdentifier(node: Parser.Node): string | undefined {
 function extractNameFromText(text: string, symbolType: string): string | undefined {
 	const firstLine = text.split('\n')[0] ?? text;
 	const patterns: Record<string, RegExp> = {
-		function: /\b(?:function|def)\s+([\w$]+)|\b([\w$]+)\s*[=:]\s*(?:async\s*)?\(/,
-		class: /\b(?:class|classdef)\s+([\w$:]+)/,
+		function: /\b(?:function|def|fun)\s+([\w$]+)|\b([\w$]+)\s*[=:]\s*(?:async\s*)?\(/,
+		class: /\b(?:class|classdef|object)\s+([\w$:]+)/,
 		struct: /\bstruct\s+([\w:]+)/,
 		union: /\bunion\s+([\w:]+)/,
 		enum: /\benum\s+(?:class\s+)?([\w:]+)/,
 		interface: /\binterface\s+([\w$]+)/,
+		property: /\b(?:val|var)\s+([\w$]+)/,
 		typedef: /\btype\s+([\w$]+)/,
 		template: /\btemplate\s*(?:<[^>]*>)?\s*(?:class|struct|typename)\s+([\w:]+)/,
 		namespace: /\bnamespace\s+([\w:]+)/,
@@ -130,7 +196,7 @@ function collectSemanticNodes(node: Parser.Node, content: string, out: Array<{ s
 	if (SEMANTIC_NODE_TYPES.has(node.type) && shouldIncludeLexicalDeclaration(node)) {
 		const text = node.text.trim();
 		if (text.length >= MIN_CHUNK_CHARS) {
-			const symbolType = NODE_TYPE_TO_SYMBOL[node.type] ?? node.type;
+			const symbolType = resolveSymbolType(node, NODE_TYPE_TO_SYMBOL[node.type] ?? node.type);
 			const start = node.startIndex;
 			const end = node.endIndex;
 			out.push({

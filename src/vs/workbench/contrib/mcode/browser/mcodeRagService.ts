@@ -142,6 +142,30 @@ class VoidRagBrowserService implements IVoidRagService {
 
 	}
 
+	async getCodeGraph(): Promise<any> {
+
+		return this.voidRag.getCodeGraph();
+
+	}
+
+	async getCodeGraphViewPayload(options?: import('../common/mcodeRagTypes.js').CodeGraphViewOptions) {
+
+		return this.voidRag.getCodeGraphViewPayload(options);
+
+	}
+
+	async queryRelations(entityName?: string, filePath?: string, relationType?: string): Promise<any[]> {
+
+		return this.voidRag.queryRelations(entityName, filePath, relationType);
+
+	}
+
+	async getRepositoryMapFromIndex(filePaths: string[], maxGraphNeighbors?: number) {
+
+		return this.voidRag.getRepositoryMapFromIndex(filePaths, maxGraphNeighbors);
+
+	}
+
 }
 
 
